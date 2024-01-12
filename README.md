@@ -33,8 +33,8 @@ TxData = TxData(data_folder_path = './data')
 TxData.prepare_split(split = 'complex_disease', seed = 42)
 TxGNN = TxGNN(data = TxData, 
               weight_bias_track = False,
-              proj_name = 'TxGNN', # wandb project name
-              exp_name = 'TxGNN', # wandb experiment name
+              proj_name = 'TxGNNv2', # wandb project name
+              exp_name = 'TxGNNv2', # wandb experiment name
               device = 'cuda:0' # define your cuda device
               )
 

@@ -16,9 +16,9 @@ class DataSplitter:
         self.grouped_diseases = pd.read_csv(os.path.join(dirname, 'kg_grouped_diseases_bert_map.csv'))
         
     def load_kg(self, pth=''):
-        kg = pd.read_csv(pth+'kg.csv', low_memory=False)
-        nodes = pd.read_csv(pth+'nodes.csv', low_memory=False)
-        edges = pd.read_csv(pth+'edges.csv', low_memory=False)
+        kg = pd.read_csv(os.path.join(pth, 'kg.csv'), low_memory=False)
+        nodes = pd.read_csv(os.path.join(pth, 'node.csv'), low_memory=False)
+        edges = pd.read_csv(os.path.join(pth, 'edges.csv'), low_memory=False)
         return kg, nodes, edges
     
     def load_do(self): 

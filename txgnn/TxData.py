@@ -95,7 +95,6 @@ class TxData:
         self.disease_eval_idx = disease_eval_idx
         self.no_kg = no_kg
         self.seed = seed
-        print('Done!')
         
         
     def retrieve_id_mapping(self):
@@ -113,14 +112,18 @@ class TxData:
         df_['x_id'] = df_.x_id.apply(lambda x: convert2str(x))
         df_['y_id'] = df_.y_id.apply(lambda x: convert2str(x))
 
+        # 17080 diseases
         id2name_disease = dict(df_[df_.x_type == 'disease'][['x_id', 'x_name']].drop_duplicates().values)
         id2name_disease.update(dict(df_[df_.y_type == 'disease'][['y_id', 'y_name']].drop_duplicates().values))
 
+        # 7957 drugs
         id2name_drug = dict(df_[df_.x_type == 'drug'][['x_id', 'x_name']].drop_duplicates().values)
         id2name_drug.update(dict(df_[df_.y_type == 'drug'][['y_id', 'y_name']].drop_duplicates().values))
-        
+
         return {'id2name_drug': id2name_drug,
                 'id2name_disease': id2name_disease,
                 'idx2id_disease': idx2id_disease,
-                'idx2id_drug': idx2id_drug
+                'idx2id_drug': idx2id_drug,
+                'idx2name_drug': lambda x: id2name_drug[idx2id_drug[x]],
+                'idx2name_disease': lambda x: id2name_disease[idx2id_disease[x]],
                }

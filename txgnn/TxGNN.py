@@ -3,12 +3,10 @@ import math
 import argparse
 import copy
 import pickle
-from argparse import ArgumentParser
 
 import numpy as np
+import gpytorch
 import pandas as pd
-from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
 
 import dgl
 from dgl.data.utils import save_graphs
@@ -36,33 +34,37 @@ class TxGNN:
     
     def __init__(self, data,
                        weight_bias_track = False,
-                       proj_name = 'TxGNN',
-                       exp_name = 'TxGNN',
+                       proj_name = 'TxGNNv2',
+                       exp_name = 'TxGNNv2',
                        device = 'cuda:0'):
-        self.device = torch.device(device)
+        if torch.cuda.is_available():
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device( "cpu")
+
         self.weight_bias_track = weight_bias_track
         self.G = data.G
         self.df, self.df_train, self.df_valid, self.df_test = data.df, data.df_train, data.df_valid, data.df_test
+        self.id_to_dd_mapping = data.retrieve_id_mapping()
         self.data_folder = data.data_folder
         self.disease_eval_idx = data.disease_eval_idx
         self.split = data.split
         self.no_kg = data.no_kg
+        self.proj_name = proj_name
+        self.exp_name = exp_name
         
         self.disease_rel_types = ['rev_contraindication', 'rev_indication', 'rev_off-label use']
         
-        self.dd_etypes = [('drug', 'contraindication', 'disease'), 
-                  ('drug', 'indication', 'disease'), 
-                  ('drug', 'off-label use', 'disease'),
-                  ('disease', 'rev_contraindication', 'drug'), 
-                  ('disease', 'rev_indication', 'drug'), 
-                  ('disease', 'rev_off-label use', 'drug')]
+        # Used for Finetuning
+        self.dd_etypes = [
+            ('drug', 'contraindication', 'disease'), 
+            ('drug', 'indication', 'disease'), 
+            ('drug', 'off-label use', 'disease'),
+            ('disease', 'rev_contraindication', 'drug'), 
+            ('disease', 'rev_indication', 'drug'), 
+            ('disease', 'rev_off-label use', 'drug')
+        ]
         
-        if self.weight_bias_track:
-            import wandb
-            wandb.init(project=proj_name, name=exp_name)  
-            self.wandb = wandb
-        else:
-            self.wandb = None
         self.config = None
         
     def model_initialize(self, n_hid = 128, 
@@ -97,10 +99,18 @@ class TxGNN:
                        'sim_measure': sim_measure,
                        'bert_measure': bert_measure,
                        'agg_measure': agg_measure,
+                       'exp_lambda': exp_lambda,
                        'num_walks': num_walks,
                        'walk_mode': walk_mode,
-                       'path_length': path_length
+                       'path_length': path_length,
                       }
+
+        if self.weight_bias_track:
+            import wandb
+            wandb.init(project=self.proj_name, name=self.exp_name, config=self.config)  
+            self.wandb = wandb
+        else:
+            self.wandb = None
 
         self.model = HeteroRGCN(self.G,
                    in_size=n_inp,
@@ -118,22 +128,35 @@ class TxGNN:
                    split = self.split,
                    data_folder = self.data_folder,
                    exp_lambda = exp_lambda,
-                   device = self.device
+                   device = self.device,
+                   id_to_dd_mapping=self.id_to_dd_mapping,
                   ).to(self.device)    
         self.best_model = self.model
         
-    def pretrain(self, n_epoch = 1, learning_rate = 1e-3, batch_size = 1024, train_print_per_n = 20, sweep_wandb = None):
-        
+    def pretrain(self, 
+                 n_epoch = 1, 
+                 n_steps = None, 
+                 learning_rate = 1e-3, 
+                 batch_size = 1024, 
+                 train_print_per_n = 20, 
+                 checkpoint_per_n = 1000, 
+                 checkpint_path = '',
+                 sweep_wandb = None):
+
+        assert not (n_epoch is not None and n_steps is not None), 'Only one field can be specified'
         if self.no_kg:
             raise ValueError('During No-KG ablation, pretraining is infeasible because it is the same as finetuning...')
             
         self.G = self.G.to('cpu')
         print('Creating minibatch pretraining dataloader...')
+
+        # Dict from relationship (source node type, edge type and destination node type) to edges
+        # Set up data for link prediction
         train_eid_dict = {etype: self.G.edges(form = 'eid', etype =  etype) for etype in self.G.canonical_etypes}
         sampler = dgl.dataloading.MultiLayerFullNeighborSampler(2)
         dataloader = dgl.dataloading.EdgeDataLoader(
             self.G, train_eid_dict, sampler,
-            negative_sampler=Minibatch_NegSampler(self.G, 1, 'fix_dst'),
+            negative_sampler=Minibatch_NegSampler(self.G, 1, 'fix_dst'),  # Negative sampler for link prediction
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
@@ -141,17 +164,25 @@ class TxGNN:
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate)
 
-        print('Start pre-training with #param: %d' % (get_n_params(self.model)))
+        print('Start pre-training with #param: {},  #batches/epoch: {}'.format(
+            get_n_params(self.model), len(dataloader)))
+
+        if n_epoch is None:
+            n_epoch = 1
 
         for epoch in range(n_epoch):
-
+            max_steps = n_steps
             for step, (nodes, pos_g, neg_g, blocks) in enumerate(dataloader):
+                if max_steps is not None:
+                    if step >= max_steps:
+                        break
 
                 blocks = [i.to(self.device) for i in blocks]
                 pos_g = pos_g.to(self.device)
                 neg_g = neg_g.to(self.device)
-                pred_score_pos, pred_score_neg, pos_score, neg_score = self.model.forward_minibatch(pos_g, neg_g, blocks, self.G, mode = 'train', pretrain_mode = True)
-
+                # `pred_score_pos` also has the realtionship
+                pred_score_pos, pred_score_neg, pos_score, neg_score = self.model.forward_minibatch(
+                    pos_g, neg_g, blocks, self.G, mode = 'train', pretrain_mode = True)
                 scores = torch.cat((pos_score, neg_score)).reshape(-1,)
                 labels = [1] * len(pos_score) + [0] * len(neg_score)
 
@@ -165,10 +196,12 @@ class TxGNN:
 
                 if step % train_print_per_n == 0:
                     # pretraining tracking...
-                    auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc = get_all_metrics_fb(pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, self.G, True)
+                    auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc = get_all_metrics_fb(
+                        pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, self.G, True)
                     
                     if self.weight_bias_track:
-                        temp_d = get_wandb_log_dict(auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc, "Pretraining")
+                        temp_d = get_wandb_log_dict(
+                            auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc, "Pretraining")
                         temp_d.update({"Pretraining LR": optimizer.param_groups[0]['lr']})
                         self.wandb.log(temp_d)
                     
@@ -190,12 +223,22 @@ class TxGNN:
                         macro_auroc,
                         macro_auprc
                     ))
+                if step % checkpoint_per_n == 0:
+                    # checkpoint model...
+                    print('Saving checkpoint at step {} to {}'.format(step, checkpint_path))
+                    self.save_model(checkpint_path, optimizer=optimizer, step=step, best=False)
+
+        # Use the pretrained model as the initialization for the best `finetuned` model
         self.best_model = copy.deepcopy(self.model)
+        print('Done pretraining. Saving model to {}'.format(checkpint_path))
+        self.save_model(checkpint_path, optimizer=optimizer, step=step, best=True)
         
-    def finetune(self, n_epoch = 500, 
+    def finetune(self, n_epoch = 500,
+                       batch_size = 64,
                        learning_rate = 1e-3, 
                        train_print_per_n = 5, 
                        valid_per_n = 25,
+                       finetune_dist_mult_only = False,
                        sweep_wandb = None,
                        save_name = None):
         
@@ -203,21 +246,29 @@ class TxGNN:
 
         self.G = self.G.to(self.device)
         neg_sampler = Full_Graph_NegSampler(self.G, 1, 'fix_dst', self.device)
-        torch.nn.init.xavier_uniform(self.model.w_rels) # reinitialize decoder
+        # reinitialize decoder
+        torch.nn.init.xavier_uniform(self.model.w_rels)
         
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate)
+        if finetune_dist_mult_only:
+            optimizer = torch.optim.AdamW(self.model.pred.parameters(), lr = learning_rate)
+        else:
+            optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.8)
-        
-        for epoch in range(n_epoch):
-            negative_graph = neg_sampler(self.G)
-            pred_score_pos, pred_score_neg, pos_score, neg_score = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train')
+
+        negative_graph = neg_sampler(self.G)
+        for epoch in range(n_epoch):       
+            #negative_graph = neg_sampler(self.G)
+            pred_score_pos, pred_score_neg, pos_score, neg_score = self.model(
+                self.G, negative_graph, pretrain_mode = False, mode = 'train')
 
             pos_score = torch.cat([pred_score_pos[i] for i in self.dd_etypes])
             neg_score = torch.cat([pred_score_neg[i] for i in self.dd_etypes])
 
-            scores = torch.sigmoid(torch.cat((pos_score, neg_score)).reshape(-1,))
+            scores = torch.cat((pos_score, neg_score)).reshape(-1,)
+            scores = torch.sigmoid(scores)
             labels = [1] * len(pos_score) + [0] * len(neg_score)
             loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device))
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -227,8 +278,9 @@ class TxGNN:
                 self.wandb.log({"Training Loss": loss})
 
             if epoch % train_print_per_n == 0:
-                # training tracking...
-                auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc = get_all_metrics_fb(pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, self.G, True)
+                # finetuning tracking...
+                auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc = get_all_metrics_fb(
+                    pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, self.G, True)
 
                 if self.weight_bias_track:
                     temp_d = get_wandb_log_dict(auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc, "Training")
@@ -245,24 +297,25 @@ class TxGNN:
                     macro_auprc
                 ))
 
-                print('----- AUROC Performance in Each Relation -----')
-                print_dict(auroc_rel)
-                print('----- AUPRC Performance in Each Relation -----')
-                print_dict(auprc_rel)
-                print('----------------------------------------------')
+                #print('----- AUROC Performance in Each Relation -----')
+                #print_dict(auroc_rel)
+                #print('----- AUPRC Performance in Each Relation -----')
+                #print_dict(auprc_rel)
+                #print('----------------------------------------------')
 
             del pred_score_pos, pred_score_neg, scores, labels
 
+
             if (epoch) % valid_per_n == 0:
                 # validation tracking...
-                print('Validation.....')
-                (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss = evaluate_fb(self.model, self.g_valid_pos, self.g_valid_neg, self.G, self.dd_etypes, self.device, mode = 'valid')
+                (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss = evaluate_fb(
+                    self.model, self.g_valid_pos, self.g_valid_neg, self.G, self.dd_etypes, self.device, mode = 'valid')
 
                 if best_val_acc < macro_auroc:
                     best_val_acc = macro_auroc
                     self.best_model = copy.deepcopy(self.model)
 
-                print('Epoch: %d LR: %.5f Validation Loss %.4f,  Validation Micro AUROC %.4f Validation Micro AUPRC %.4f Validation Macro AUROC %.4f Validation Macro AUPRC %.4f (Best Macro AUROC %.4f)' % (
+                print('Validation: Epoch: %d LR: %.5f Validation Loss %.4f,  Validation Micro AUROC %.4f Validation Micro AUPRC %.4f Validation Macro AUROC %.4f Validation Macro AUPRC %.4f (Best Macro AUROC %.4f)' % (
                     epoch,
                     optimizer.param_groups[0]['lr'], 
                     loss,
@@ -273,11 +326,11 @@ class TxGNN:
                     best_val_acc
                 ))
 
-                print('----- AUROC Performance in Each Relation -----')
-                print_dict(auroc_rel)
-                print('----- AUPRC Performance in Each Relation -----')
-                print_dict(auprc_rel)
-                print('----------------------------------------------')
+                #print('----- AUROC Performance in Each Relation -----')
+                #print_dict(auroc_rel)
+                #print('----- AUPRC Performance in Each Relation -----')
+                #print_dict(auprc_rel)
+                #print('----------------------------------------------')
                 
                 if sweep_wandb is not None:
                     sweep_wandb.log({'validation_loss': loss, 
@@ -295,10 +348,10 @@ class TxGNN:
                                   })
 
                     self.wandb.log(temp_d)
-        
-        print('Testing...')
 
-        (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss, pred_pos, pred_neg = evaluate_fb(self.best_model, self.g_test_pos, self.g_test_neg, self.G, self.dd_etypes, self.device, True, mode = 'test')
+        print('Testing...')
+        (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss, pred_pos, pred_neg = evaluate_fb(
+            self.best_model, self.g_test_pos, self.g_test_neg, self.G, self.dd_etypes, self.device, True, mode = 'test')
 
         print('Testing Loss %.4f Testing Micro AUROC %.4f Testing Micro AUPRC %.4f Testing Macro AUROC %.4f Testing Macro AUPRC %.4f' % (
             loss,
@@ -329,8 +382,7 @@ class TxGNN:
         print_dict(auprc_rel, dd_only = False)
         print('----------------------------------------------')
         
-        
-    def save_model(self, path):
+    def save_model(self, path, optimizer=None, step=-1, epoch=-1, best=True):
         if not os.path.exists(path):
             os.mkdir(path)
         
@@ -339,8 +391,18 @@ class TxGNN:
         
         with open(os.path.join(path, 'config.pkl'), 'wb') as f:
             pickle.dump(self.config, f)
-       
-        torch.save(self.best_model.state_dict(), os.path.join(path, 'model.pt'))
+
+        if best:
+            torch.save(self.best_model.state_dict(), os.path.join(path, 'best_model.pt'))
+        else:
+            assert step != -1
+            assert optimizer is not None
+            torch.save(
+                {'model_state_dict': self.model.state_dict(),
+                 'optimizer_state_dict': optimizer.state_dict(),
+                 'step': step,
+                 'epoch': epoch,
+                }, os.path.join(path, 'model.pt'))            
         #save_graphs(os.path.join(path, 'graph_dgl.bin', [self.G]))
     
     def predict(self, df):
@@ -455,7 +517,10 @@ class TxGNN:
         self.config = config
         #self.G = initialize_node_embedding(self.G, config['n_inp'])
         
-        state_dict = torch.load(os.path.join(path, 'model.pt'), map_location = torch.device('cpu'))
+        try:
+            state_dict = torch.load(os.path.join(path, 'best_model.pt'), map_location = torch.device('cpu'))
+        except:
+            state_dict = torch.load(os.path.join(path, 'model.pt'), map_location = torch.device('cpu'))
         if next(iter(state_dict))[:7] == 'module.':
             # the pretrained model is from data-parallel module
             from collections import OrderedDict

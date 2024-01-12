@@ -1,6 +1,8 @@
-pandas
+pandas==1.5.3
 numpy
 tqdm
 matplotlib
 scikit-learn
 goatools
+gpytorch
+chardet

@@ -393,7 +393,6 @@ def get_all_metrics(y, pred, rels):
             micro_auprc, macro_auroc, macro_auprc
 
 def get_all_metrics_fb(pred_score_pos, pred_score_neg, scores, labels, G, full_mode = False):
-
     auroc_rel = {}
     auprc_rel = {}
     
@@ -406,20 +405,20 @@ def get_all_metrics_fb(pred_score_pos, pred_score_neg, scores, labels, G, full_m
                   ('disease', 'rev_contraindication', 'drug'), 
                   ('disease', 'rev_indication', 'drug'), 
                   ('disease', 'rev_off-label use', 'drug')]
-        
+  
     for etype in etypes:
-        
         try:
             out_pos = pred_score_pos[etype].reshape(-1,).detach().cpu().numpy()
             out_neg = pred_score_neg[etype].reshape(-1,).detach().cpu().numpy()
             pred_ = np.concatenate((out_pos, out_neg))
             y_ = [1]*len(out_pos) + [0]*len(out_neg)
-        
+
+            # These values are not normalised
             auroc_rel[etype] = roc_auc_score(y_, pred_)
             auprc_rel[etype] = average_precision_score(y_, pred_)
         except:
             pass
-    
+
     micro_auroc = roc_auc_score(labels, scores)
     micro_auprc = average_precision_score(labels, scores)
     macro_auroc = np.mean(list(auroc_rel.values()))
@@ -445,7 +444,7 @@ def evaluate_fb(model, g_pos, g_neg, G, dd_etypes, device, return_embed = False,
     scores = torch.sigmoid(torch.cat((pos_score, neg_score)).reshape(-1,))
     labels = [1] * len(pos_score) + [0] * len(neg_score)
     loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(device))
-            
+
     if return_embed:
         return get_all_metrics_fb(pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, G, True), loss.item(), pred_score_pos, pred_score_neg
     else:
@@ -540,7 +539,7 @@ def evaluate_mb(model, g_pos, g_neg, G, dd_etypes, device, return_embed = False,
     scores = torch.sigmoid(torch.cat((pos_score, neg_score)).reshape(-1,))
     labels = [1] * len(pos_score) + [0] * len(neg_score)
     loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(device))
-    
+
     model = model.to(device)
     if return_embed:
         return get_all_metrics_fb(pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, G, True), loss.item(), pred_score_pos, pred_score_neg
@@ -562,10 +561,12 @@ def print_dict(x, dd_only = True):
                   ('disease', 'rev_off-label use', 'drug')]
         
         for i in etypes:
-            print(str(i) + ': ' + str(x[i]))
+            print('{}: {:.4f}'.format(i, x[i]))
+            #print(str(i) + ': ' + str(x[i]))
     else:
         for i, j in x.items():
-            print(str(i) + ': ' + str(j))
+            print('{}: {:.4f}'.format(i, j))
+            #print(str(i) + ': ' + str(j))
         
 def to_wandb_table(auroc, auprc):
     return [[idx, i[1], j, auprc[i]] for idx, (i, j) in enumerate(auroc.items())]

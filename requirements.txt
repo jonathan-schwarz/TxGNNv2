@@ -1,6 +1,7 @@
 accelerate
 absl-py
 bitsandbytes
+datasets
 chardet
 goatools
 gpytorch

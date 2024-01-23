@@ -17,7 +17,7 @@ from scipy.stats import entropy
 from scipy.special import softmax
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
-DATA_PATH = '/home/jos1479/data/'
+DATA_PATH = '/n/home06/jschwarz/data/TxGNN/'
 
 FLAGS = flags.FLAGS
 
@@ -34,7 +34,7 @@ flags.DEFINE_float('learning_rate', 0.01, 'LR')
 flags.DEFINE_integer('final_dim', 256, 'DKL Final Dim.', lower_bound=1)
 flags.DEFINE_integer('hidden_dim', 256, 'DKL Hidden Dim.', lower_bound=1)
 flags.DEFINE_integer('n_inducing', 100, 'Number of inducing points.', lower_bound=1)
-flags.DEFINE_integer('n_layers', 1, 'DKL Hidden Layers.', lower_bound=1)
+flags.DEFINE_integer('n_layers', 3, 'DKL Hidden Layers.', lower_bound=1)
 
 
 # Misc
@@ -293,7 +293,6 @@ def main(argv):
         num_test_points = test_x.shape[0]
         inducing_x = None
     elif 'txgnn_d' in FLAGS.dataset:
-
         path = os.path.join(
             DATA_PATH, 'pretrained_mine/complex_disease/separate/{}.npz')
 
@@ -378,7 +377,7 @@ def main(argv):
         optimizer = torch.optim.Adam(params, lr=FLAGS.learning_rate)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.9, patience=2)
+        optimizer, mode='min', factor=0.9, patience=5)
 
     # "Loss" for GPs - the marginal log likelihood
     # num_data refers to the number of training datapoints
@@ -572,8 +571,8 @@ def main(argv):
     test_auprc = (test_auprc  / float(n_batches))
     test_entropy = (test_entropy  / float(len(test_loader.dataset)))
     
-    print('Test Loss: {:.3f} - Acc: {}/{} ({:.3f}%) - AUROC: {:.3f} - AUPRC: {:.3f} - Entropy: {:.3f}'.format(
-        test_loss, test_correct.item(), len(test_loader.dataset), test_acc, test_auroc, test_auprc, test_entropy)
+    print('{}. test loss: {:.3f} - acc: {}/{} ({:.3f}%) - auroc: {:.3f} - auprc: {:.3f} - entropy: {:.3f}'.format(
+        FLAGS.dataset, test_loss, test_correct.item(), len(test_loader.dataset), test_acc, test_auroc, test_auprc, test_entropy)
     )
     wandb_log_dict = {'test_loss': test_loss, 'test_acc': test_acc, 
                       'test_auroc': test_auroc, 'test_auprc': test_auprc,

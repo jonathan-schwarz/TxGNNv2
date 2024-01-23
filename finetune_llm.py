@@ -12,71 +12,55 @@ from scipy.stats import entropy
 from scipy.special import softmax
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
-from accelerate import Accelerator
+from datasets import load_dataset
+import evaluate
 from transformers import (
     AdamW,
+    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     BitsAndBytesConfig,
-    DistilBertTokenizerFast,
-    DistilBertForSequenceClassification,
-    TrainingArguments,
+    DataCollatorWithPadding,
     pipeline,
-    logging,
+    TrainingArguments,
+    Trainer,
 )
 from peft import (
-    get_peft_config,
-    get_peft_model,
-    get_peft_model_state_dict,
-    set_peft_model_state_dict,
     LoraConfig,
-    PeftType,
     PromptEncoderConfig,
 )
+from utils import load_txgnn_dataset
+
+
+os.environ["WANDB_PROJECT"]="TxGNNv2"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 DATA_PATH = '/n/home06/jschwarz/data/TxGNN/'
 
 FLAGS = flags.FLAGS
 
 # Training settings
-flags.DEFINE_integer('n_epochs', 10, 'Number of epochs.', lower_bound=1)
-flags.DEFINE_integer('batch_size', 32, 'Finetuning Batch size.', lower_bound=1)
+flags.DEFINE_integer('n_epochs', 5, 'Number of epochs.', lower_bound=1)
+flags.DEFINE_integer('n_max_steps', 10, 'Maximum number of training steps.', lower_bound=1)
+flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
+flags.DEFINE_integer('eval_batch_size', 24, 'Eval Batch size.', lower_bound=1)
 
 # Model
-flags.DEFINE_enum('model', 'llama2_7b', ['bert', 'llama2_7b'], 'Model.')
-flags.DEFINE_enum('finetune_type', 'lora', ['full', 'lora', 'qlora', 'p'], 'Finetunting type.')
+flags.DEFINE_enum('model', 'distilbert', ['distilbert', 'llama2_7b', 'llama2_13b'], 'Model.')
+flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora'], 'Finetunting type.')
+flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
 
 # Misc
-flags.DEFINE_boolean('wandb_track', True, 'Use WandB')
-# Valid choices are ['did', 'dod', 'dcd', 'drid', 'drod', 'drcd']
-flags.DEFINE_string('dataset', 'txgnn_did', 'Dataset.')
+flags.DEFINE_boolean('wandb_track', False, 'Use WandB')
+flags.DEFINE_enum('dataset', 'txgnn_did', ['guanaco', 'imdb', 'txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
 flags.DEFINE_string('checkpoint', './checkpoints/model_ckpt', 'Checkpoint location.')
 flags.DEFINE_integer('valid_every', 250, 'Validation every #steps.', lower_bound=1)
 flags.DEFINE_string('data_path', './data', 'Data location.')
 flags.DEFINE_string('exp_name', 'debug', 'Experiment name.')
 
-# bitsandbytes parameters
-gradient_accumulation_steps = 1  # Number of update steps to accumulate the gradients for
-gradient_checkpointing = True  # Enable gradient checkpointing
-max_grad_norm = 0.3  # Maximum gradient normal (gradient clipping)
-learning_rate = 2e-4  # Initial learning rate (AdamW optimizer)
-weight_decay = 0.001  # Weight decay to apply to all layers except bias/LayerNorm weights
-optim = "paged_adamw_32bit"  # Optimizer to use
-lr_scheduler_type = "cosine"  # Learning rate schedule
-warmup_ratio = 0.03  # Ratio of steps for a linear warmup (from 0 to learning rate)
-
-# Group sequences into batches with same length
-# Saves memory and speeds up training considerably
-group_by_length = True
-
-# SFT parameters
-max_seq_length = None
-packing = False  # Pack multiple short examples in the same input sequence to increase efficiency
-
-# Load the entire model on the GPU 0
-device_map = {"": 0}
-
+id2label = {0: "NEGATIVE", 1: "POSITIVE"}
+label2id = {"NEGATIVE": 0, "POSITIVE": 1}
 
 DD_TYPES = {
     'did': 'drug_indication_disease', 
@@ -86,6 +70,32 @@ DD_TYPES = {
     'drod': 'disease_rev_off-label use_drug',
     'drcd': 'disease_rev_contraindication_drug',
 }
+
+accuracy = evaluate.load("accuracy")
+
+
+
+
+def _get_gpu_utilization():
+    nvmlInit()
+    handle = nvmlDeviceGetHandleByIndex(0)
+    info = nvmlDeviceGetMemoryInfo(handle)
+    return f"GPU memory occupied: {info.used//1024**2} MB."
+
+
+def _compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    prediction_probs = softmax(logits, axis=1)
+    predictions = np.argmax(logits, axis=1)
+
+    relevant_prediction_probs = 1.0 - prediction_probs[
+        range(labels.shape[0]), labels.astype(np.int32).flatten()][:, np.newaxis]
+
+    metric_dict = accuracy.compute(predictions=predictions, references=labels)
+    metric_dict['auroc'] = roc_auc_score(labels, relevant_prediction_probs)
+    metric_dict['auprc'] = average_precision_score(labels, relevant_prediction_probs)
+    return metric_dict
+
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -102,13 +112,6 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.labels)
 
 
-def get_gpu_utilization():
-    nvmlInit()
-    handle = nvmlDeviceGetHandleByIndex(0)
-    info = nvmlDeviceGetMemoryInfo(handle)
-    return f"GPU memory occupied: {info.used//1024**2} MB."
-
-
 def main(argv):
 
     if torch.cuda.is_available():
@@ -116,68 +119,52 @@ def main(argv):
     else:
         device = torch.device( "cpu")
 
-
-    if FLAGS.wandb_track:
-        import wandb
-        wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model))
+    #if FLAGS.wandb_track:
+    #    import wandb
+    #    wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model))
 
     # Load relevant tokenizer
-    max_length = 49  # Length of bert
-    if 'bert' == FLAGS.model:
-        tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+    if 'distilbert' == FLAGS.model:
+        tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
     elif  'llama2_7b' == FLAGS.model:
-        tokenizer = AutoTokenizer.from_pretrained('NousResearch/Llama-2-7b-chat-hf', trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained('NousResearch/Llama-2-7b-hf', trust_remote_code=True)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
+    elif  'llama2_13b' == FLAGS.model:
+        tokenizer = AutoTokenizer.from_pretrained('NousResearch/Llama-2-7b-hf', trust_remote_code=True)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
 
-    if 'txgnn_d' in FLAGS.dataset:
-        path = os.path.join(
-            DATA_PATH, 'pretrained_mine/complex_disease/separate/{}.npz')
+    def _preprocess_function(examples):
+        max_length = 20  # Length of bert
+        return tokenizer(examples["text"], truncation=True, padding=True, max_length=max_length)
 
-        data = np.load(path.format(
-            DD_TYPES[FLAGS.dataset.split('_')[1]]))
+    if 'imdb' in FLAGS.dataset:
+        imdb = load_dataset("imdb")
+        tokenized_dataset = imdb.map(_preprocess_function, batched=True)
+        data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+        task_type = "SEQ_CLS"
+    elif 'guanaco' in FLAGS.dataset:
+        dataset = load_dataset("mlabonne/guanaco-llama2-1k", split="train")
+        task_type = "CAUSAL_LM"
+    elif 'txgnn_d' in FLAGS.dataset:
+        txgnn = load_txgnn_dataset(FLAGS.dataset.split('_')[1])
+        tokenized_dataset = txgnn.map(_preprocess_function, batched=True)
+        data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+        task_type = "SEQ_CLS"
 
-        train_text = np.concatenate(
-            [data['train_u_names'], data['train_v_names']], axis=1)
-        train_text = ['Does {} treat {}?'.format(train_text[i][0], train_text[i][1]) for i in range(train_text.shape[0])]
-        train_encodings = tokenizer(train_text, truncation=True, padding=True, max_length=max_length)
-        train_y = data['train_labels'][:, 0].astype(np.int32).tolist()
-
-        valid_text = np.concatenate(
-            [data['valid_u_names'], data['valid_v_names']], axis=1)
-        valid_text = ['Does {} treat {}?'.format(valid_text[i][0], valid_text[i][1]) for i in range(valid_text.shape[0])]
-        valid_encodings = tokenizer(valid_text, truncation=True, padding=True, max_length=max_length)
-        valid_y = data['valid_labels'][:, 0].astype(np.int32).tolist()
-
-        test_text = np.concatenate(
-            [data['test_u_names'], data['test_v_names']], axis=1)
-        test_text = ['Does {} treat {}?'.format(test_text[i][0], test_text[i][1]) for i in range(test_text.shape[0])]
-        test_encodings = tokenizer(test_text, truncation=True, padding=True, max_length=max_length)
-        test_y = data['test_labels'][:, 0].astype(np.int32).tolist()
-
-    train_set = Dataset(train_encodings, train_y)
-    valid_set = Dataset(valid_encodings, valid_y)
-    test_set = Dataset(test_encodings, test_y)
-
-    num_train_points = len(train_text)
-    num_valid_points = len(valid_text)
-    num_test_points = len(test_text)
-    inducing_x = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=FLAGS.batch_size, shuffle=True)
-    valid_loader = torch.utils.data.DataLoader(
-        valid_set, batch_size=FLAGS.batch_size, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(
-        test_set, batch_size=FLAGS.batch_size, shuffle=False)
-
-    if 'bert' == FLAGS.model:
+    # Load the entire model on the GPU 0
+    device_map = {"": 0}
+    use_bf16 = False
+    if 'distilbert' == FLAGS.model:
         model = AutoModelForSequenceClassification.from_pretrained(
             "distilbert-base-uncased",
-            device_map=device_map
+            device_map=device_map,
+            num_labels=2,
+            id2label=id2label,
+            label2id=label2id,
         )
-        model.to(device)
-    elif 'llama2_7b' == FLAGS.model:
+    elif 'llama2' in FLAGS.model:
         # Load tokenizer and model with QLoRA configuration
         compute_dtype = getattr(torch, "float16")
         bf16 = False
@@ -197,122 +184,123 @@ def main(argv):
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=False,
         )
-        model = AutoModelForSequenceClassification.from_pretrained(
-            "NousResearch/Llama-2-7b-chat-hf",
-            quantization_config=bnb_config,
-            device_map=device_map,
-            return_dict=True
-        )
+        if FLAGS.model == 'llama2_7b':
+            model_type = "NousResearch/Llama-2-7b-hf"
+        elif  FLAGS.model == 'llama2_13b':
+            import pdb; pdb.set_trace()
+            model_type = "NousResearch/Llama-2-13b-hf"
+
+        if 'SEQ_CLS' == task_type:
+
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_type,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                num_labels=2,
+                id2label=id2label,
+                label2id=label2id,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_type,
+                quantization_config=bnb_config,
+                device_map=device_map
+            )
+
+            # Make predictions
+            pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer, max_length=200)
+            prompt = txgnn['test'][0]['text']
+            result = pipe(f"<s>[INST] {prompt} [/INST]")
+            print(result[0]['generated_text'])
+
         model.config.use_cache = False
         model.config.pretraining_tp = 1
+        use_bf16 = True
 
     print("=" * 80)
-    print("Model loaded. " + get_gpu_utilization())
+    print("Model loaded. " + _get_gpu_utilization())
     print("=" * 80)
 
+    optim = 'adamw_torch'
     if 'lora' in FLAGS.finetune_type:
-        peft_config = LoraConfig(
-            task_type="SEQ_CLS",
-            lora_alpha=16,
-            lora_dropout=0.1,
-            r=64,
-            bias="none",
-        )
-        model = get_peft_model(model, peft_config)
-    elif 'p' in FLAGS.finetune_type:
-        # Load LoRA configuration
-        peft_config = PromptEncoderConfig(
-            task_type="SEQ_CLS",
-            num_virtual_tokens=20,
-            encoder_hidden_size=128)
-        model = get_peft_model(model, peft_config)
+
+        kwargs = {
+            'task_type': task_type,
+            'lora_alpha': 16,
+            'lora_dropout': 0.1,
+            'r': 64,
+            'bias': "none",
+            'modules_to_save': ["score"],
+        }
+        if not FLAGS.lora_apply_everywhere:
+            kwargs['target_modules'] = ["q_proj", "k_proj", "v_proj"]  # "out_proj", "fc_in", "fc_out", "wte"]
+
+        peft_config = LoraConfig(**kwargs)
+        optim = 'paged_adamw_32bit'
     elif 'full' in FLAGS.finetune_type:
-        pass
+        peft_config = None
 
-    model.print_trainable_parameters()
+    if peft_config is not None:
+        model.add_adapter(peft_config)
 
-    # Go into train mode
-    model.train()
+    # Set training parameters
+    training_args = TrainingArguments(
+	output_dir="~/logs/huggingface",
+	num_train_epochs=FLAGS.n_epochs,
+	#max_steps=FLAGS.n_max_steps,
+	per_device_train_batch_size=FLAGS.batch_size,
+	per_device_eval_batch_size=FLAGS.eval_batch_size,
+        # Optimization settings
+	learning_rate=2e-5,
+	weight_decay=0.01,
+	max_grad_norm=0.3,
+	lr_scheduler_type='cosine',
+	warmup_ratio=0.03,
+        # Logging & Validation settings
+        logging_steps=25,
+	evaluation_strategy="steps",
+        eval_steps=200,
+	save_strategy="epoch",
+	load_best_model_at_end=False,
+        # Efficiency settings
+	fp16=False,
+	bf16=use_bf16,
+        gradient_checkpointing=False,
+	gradient_accumulation_steps=1,
+	optim=optim,
+        report_to="wandb" if FLAGS.wandb_track else "none",
+        run_name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model),
+    )
 
-    # Optimizer, Criterion & LR scheduler   
-    optimizer = AdamW(model.parameters(), lr=5e-5)
-    criterion = torch.nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.9, patience=2)
+    # Set supervised fine-tuning parameters
+    trainer = Trainer(
+	model=model,
+	args=training_args,
+	train_dataset=tokenized_dataset["train"],
+	eval_dataset=tokenized_dataset["valid"],
+	tokenizer=tokenizer,
+	data_collator=data_collator,
+	compute_metrics=_compute_metrics,
+    )
+    # Train model
+    print('Training')
+    trainer.train()
 
-    for i in range(FLAGS.n_epochs):
-        j = 0
-        for batch in train_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+    # Test set evaluation
+    print('Test set evaluation')
+    print(trainer.evaluate(tokenized_dataset['test']))
 
-            optimizer.zero_grad()
+    # Make predictions
+    if 'SEQ_CLS' == task_type:
+        pipe = pipeline(task="text-classification", model=model, tokenizer=tokenizer)
+    elif 'SEQ_GEN' == task_type:
+        pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer)
 
-            # Get predictive output
-            output = model(input_ids, attention_mask=attention_mask, labels=labels)
-            loss = output.loss
-            pred_label = output.logits.argmax(-1)
-
-            # Train step
-            loss.backward()
-            # loss.backward()
-            optimizer.step()
-
-            # Metrics
-            train_correct = pred_label.eq(labels.view_as(pred_label)).cpu().sum()
-            train_acc = 100. * train_correct.item() / FLAGS.batch_size
-
-            print('Epoch/Iter: {}/{} - Train Loss: {:.3f} - Acc: {:.3f}'.format(
-                    i + 1, j + 1, loss.item(), train_acc))
-
-            if FLAGS.wandb_track:
-                wandb.log({
-                    'train_loss': loss, 'train_acc': train_acc, 'train_lr': optimizer.param_groups[0]['lr']})
-
-            # if 0 == (j % FLAGS.valid_every):
-                valid_correct = 0
-                valid_loss = 0.0
-                n_batches = 0
-                with torch.no_grad():
-                    for batch in train_loader:
-                        if torch.cuda.is_available():
-                            input_ids = batch['input_ids'].to(device)
-                            attention_mask = batch['attention_mask'].to(device)
-                            labels = batch['labels'].to(device)
-
-                        # Get predictive output
-                        output = model(input_ids, attention_mask=attention_mask, labels=labels)
-                        valid_loss += output.loss
-                        pred_label = output.logits.argmax(-1)
-
-                        valid_correct += pred_label.eq(labels.view_as(pred_label)).cpu().sum()
-                        n_batches += 1
-
-                # Track Validation loss
-                valid_acc = 100. * valid_correct.item() / float(32 * n_batches)
-                valid_loss = (valid_loss  / float(n_batches)).item()
-
-                print('Epoch/Iter: {}/{} - Valid Loss: {:.3f} - Acc: {}/{} ({:.3f}%)'.format(
-                    i + 1, j + 1, valid_loss, valid_correct.item(), 32 * n_batches, valid_acc)
-                )
-
-                wandb_log_dict = {'valid_loss': valid_loss, 'valid_acc': valid_acc}
-
-                if FLAGS.wandb_track:
-                    wandb.log(wandb_log_dict)
-
-                scheduler.step(valid_loss)
-
-            j += 1
-
-
-
-    # Try the model
-    prompt = train_text[np.randint(0, num_train_points)]
-    pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer, max_length=200)
-    result = pipe(f"<s>[INST] {prompt} [/INST]")
-    print(result[0]['generated_text'])
+        # Make predictions
+        pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer, max_length=200)
+        prompt = txgnn['test'][0]['text']
+        result = pipe(f"<s>[INST] {prompt} [/INST]")
+        print(result[0]['generated_text'])
 
 
 if __name__ == '__main__':

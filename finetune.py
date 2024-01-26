@@ -2,18 +2,19 @@
 from absl import app
 from absl import flags
 
+import datetime
+import gpytorch
 import math
 import numpy as np
 import os
 import torch
-import gpytorch
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
+import wandb
 
 from gpytorch.models import ApproximateGP
 from gpytorch.variational import CholeskyVariationalDistribution
 from gpytorch.variational import GridInterpolationVariationalStrategy, UnwhitenedVariationalStrategy
-from scipy.stats import entropy
 from scipy.special import softmax
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
@@ -28,7 +29,7 @@ flags.DEFINE_integer('batch_size', 128, 'Finetuning Batch size.', lower_bound=1)
 # Model
 flags.DEFINE_boolean('use_feature_extractor', True, 'DKL')
 flags.DEFINE_enum('model', 'dkl', ['dkl', 'mlp', 'distmult'], 'Model.')
-flags.DEFINE_enum('strategy', 'grid_interpolation', 
+flags.DEFINE_enum('strategy', 'grid_interpolation',
                   ['grid_interpolation', 'unwhitened'], 'Variational Strategy.')
 flags.DEFINE_float('learning_rate', 0.01, 'LR')
 flags.DEFINE_integer('final_dim', 256, 'DKL Final Dim.', lower_bound=1)
@@ -42,13 +43,12 @@ flags.DEFINE_boolean('wandb_track', False, 'Use WandB')
 # Valid choices are ['did', 'dod', 'dcd', 'drid', 'drod', 'drcd']
 flags.DEFINE_string('dataset', 'txgnn_did', 'Dataset.')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
-flags.DEFINE_string('checkpoint', './checkpoints/model_ckpt', 'Checkpoint location.')
+flags.DEFINE_string('checkpoint', './checkpoints/finetune/model_ckpt', 'Checkpoint location.')
 flags.DEFINE_integer('valid_every', 25, 'Validation every #steps.', lower_bound=1)
 flags.DEFINE_string('data_path', './data', 'Data location.')
-flags.DEFINE_string('exp_name', 'debug', 'Experiment name.')
 
 DD_TYPES = {
-    'did': 'drug_indication_disease', 
+    'did': 'drug_indication_disease',
     'dod': 'drug_off-label use_disease',
     'dcd': 'drug_contraindication_disease',
     'drid': 'disease_rev_indication_drug',
@@ -87,7 +87,7 @@ class GPClassificationModel(ApproximateGP):
             variational_distribution = CholeskyVariationalDistribution(
                 num_inducing_points=inducing_x.size(0))
             variational_strategy = UnwhitenedVariationalStrategy(
-                self, inducing_points=inducing_x, 
+                self, inducing_points=inducing_x,
                 variational_distribution=variational_distribution,
                 learn_inducing_locations=False
             )
@@ -107,7 +107,7 @@ class GPClassificationModel(ApproximateGP):
             variational_strategy = GridInterpolationVariationalStrategy(
                     self, grid_size=grid_size, grid_bounds=[grid_bounds],
                     variational_distribution=variational_distribution,
-            )        
+            )
             super(GPClassificationModel, self).__init__(variational_strategy)
 
             self.covar_module = gpytorch.kernels.ScaleKernel(
@@ -134,11 +134,11 @@ class GPClassificationModel(ApproximateGP):
                 assert inducing_x is not None
                 variational_strategy = gpytorch.variational.IndependentMultitaskVariationalStrategy(
                     UnwhitenedVariationalStrategy(
-                        self, inducing_points=inducing_x, 
+                        self, inducing_points=inducing_x,
                         variational_distribution=variational_distribution,
                         learn_inducing_locations=False
                     ), num_tasks=num_dim,
-                )                
+                )
             super(GPClassificationModel, self).__init__(variational_strategy)
 
             self.covar_module = gpytorch.kernels.ScaleKernel(
@@ -157,7 +157,7 @@ class GPClassificationModel(ApproximateGP):
         covar_x = self.covar_module(x)
         latent_pred = gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
         return latent_pred
-    
+
 
 class DKLModel(gpytorch.Module):
     def __init__(self, dataset, feature_extractor, strategy, num_dim, grid_bounds=(-10., 10.),
@@ -182,7 +182,7 @@ class DKLModel(gpytorch.Module):
         features = features.transpose(-1, -2).unsqueeze(-1)
         res = self.gp_layer(features)
         return res
-        
+
 
 class DistMultModel(torch.nn.Sequential):
     def __init__(self, data_dim, num_classes=2):
@@ -195,7 +195,7 @@ class DistMultModel(torch.nn.Sequential):
         else:
             self.W = torch.nn.Parameter(torch.Tensor(data_dim))
             torch.nn.init.zeros_(self.W)
-        
+
     def forward(self, x):
         h_u, h_v = x.split(self.data_dim, dim=1)
         if self.num_classes  > 2:
@@ -205,6 +205,42 @@ class DistMultModel(torch.nn.Sequential):
         return res
 
 
+def maybe_save(best_model_metrics, model_metrics, ckpt_path, model, optimizer, likelihood):
+    for k, v in best_model_metrics.items():
+        if 'auroc_auprc' == k:
+            new_metric = model_metrics['valid_auroc'] * model_metrics['valid_auprc']
+            do_save = new_metric > v
+        elif 'loss' == k:
+            new_metric = model_metrics['valid_loss']
+            do_save = new_metric < v
+        elif 'acc' == k:
+            new_metric = model_metrics['valid_acc']
+            do_save = new_metric > v
+
+        if do_save:
+            print("Saving new best model with metric '{}'. New: {:.3f} Old: {:.3f}".format(k, new_metric, v))
+            save_model(ckpt_path, k, model, optimizer, likelihood)
+            best_model_metrics[k] = new_metric
+
+    return best_model_metrics
+
+
+def save_model(path, metric_name, model, optimizer, likelihood=None):
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+    # TODO(schwarzjn): Save config
+    ckpt_file_name = 'best_' + metric_name + '_model.pt'
+    save_dict = {
+         'model_state_dict': model.state_dict(),
+         'optimizer_state_dict': optimizer.state_dict(),
+    }
+    if likelihood is not None:
+        save_dict['likelihood_state_dict'] = likelihood.state_dict()
+
+    torch.save(save_dict, os.path.join(path, ckpt_file_name))
+
+
 def main(argv):
 
     if torch.cuda.is_available():
@@ -212,9 +248,10 @@ def main(argv):
     else:
         device = torch.device( "cpu")
 
+    ckpt_path = './checkpoints/finetune/{}_finetune_{}/model_ckpt_{}'.format(
+        FLAGS.dataset, FLAGS.model, str(datetime.datetime.now()))
 
     if FLAGS.wandb_track:
-        import wandb
         wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model))
 
     if FLAGS.dataset == 'toy':
@@ -228,7 +265,7 @@ def main(argv):
 
         valid_x = torch.rand(num_valid_points).unsqueeze(-1).to(device)
         valid_y = torch.sign(torch.cos(valid_x * (4 * math.pi))).add(1).div(2).to(device)
-        valid_set = torch.utils.data.TensorDataset(valid_x, valid_y) 
+        valid_set = torch.utils.data.TensorDataset(valid_x, valid_y)
 
         test_x = torch.linspace(0, 1, num_test_points).unsqueeze(-1).to(device)
         test_y = torch.sign(torch.cos(test_x * (4 * math.pi))).add(1).div(2).to(device)
@@ -274,17 +311,17 @@ def main(argv):
         train_x = torch.Tensor(np.concatenate(
             [data['train_h_u'], data['train_h_v']], axis=1)).to(device)
         inducing_x = train_x
-        train_y = torch.Tensor(data['train_labels']).to(device)   
+        train_y = torch.Tensor(data['train_labels']).to(device)
         train_set = torch.utils.data.TensorDataset(train_x, train_y)
 
         valid_x = torch.Tensor(np.concatenate(
             [data['valid_h_u'], data['valid_h_v']], axis=1)).to(device)
-        valid_y = torch.Tensor(data['valid_labels']).to(device) 
+        valid_y = torch.Tensor(data['valid_labels']).to(device)
         valid_set = torch.utils.data.TensorDataset(valid_x, valid_y)
 
         test_x = torch.Tensor(np.concatenate(
             [data['test_h_u'], data['test_h_v']], axis=1)).to(device)
-        test_y = torch.Tensor(data['test_labels']).to(device)    
+        test_y = torch.Tensor(data['test_labels']).to(device)
         test_set = torch.utils.data.TensorDataset(test_x, test_y)
 
         data_dim = train_x.shape[1]
@@ -301,24 +338,24 @@ def main(argv):
 
         train_x = torch.Tensor(np.concatenate(
             [data['train_h_u'], data['train_h_v']], axis=1)).to(device)
-        train_y = torch.Tensor(data['train_labels']).to(device)   
+        train_y = torch.Tensor(data['train_labels']).to(device)
         train_names = np.concatenate(
             [data['train_u_names'], data['train_v_names']], axis=1)
-        train_set = torch.utils.data.TensorDataset(train_x, train_y) 
+        train_set = torch.utils.data.TensorDataset(train_x, train_y)
 
         valid_x = torch.Tensor(np.concatenate(
             [data['valid_h_u'], data['valid_h_v']], axis=1)).to(device)
-        valid_y = torch.Tensor(data['valid_labels']).to(device) 
+        valid_y = torch.Tensor(data['valid_labels']).to(device)
         valid_names = np.concatenate(
             [data['valid_u_names'], data['valid_v_names']], axis=1)
-        valid_set = torch.utils.data.TensorDataset(valid_x, valid_y) 
+        valid_set = torch.utils.data.TensorDataset(valid_x, valid_y)
 
         test_x = torch.Tensor(np.concatenate(
             [data['test_h_u'], data['test_h_v']], axis=1)).to(device)
-        test_y = torch.Tensor(data['test_labels']).to(device)     
+        test_y = torch.Tensor(data['test_labels']).to(device)
         test_names = np.concatenate(
             [data['test_u_names'], data['test_v_names']], axis=1)
-        test_set = torch.utils.data.TensorDataset(test_x, test_y) 
+        test_set = torch.utils.data.TensorDataset(test_x, test_y)
 
         data_dim = train_x.shape[1]
         num_classes = 2
@@ -338,9 +375,9 @@ def main(argv):
     if 'dkl' == FLAGS.model:
         # Initialize model and likelihood
         feature_extractor = FeatureExtractor(
-            data_dim=data_dim, 
-            hidden_dim=FLAGS.hidden_dim, 
-            n_layers=FLAGS.n_layers, 
+            data_dim=data_dim,
+            hidden_dim=FLAGS.hidden_dim,
+            n_layers=FLAGS.n_layers,
             final_dim=FLAGS.final_dim).to(device)
         model = DKLModel(FLAGS.dataset, feature_extractor, strategy=FLAGS.strategy,
                          num_dim=FLAGS.final_dim, inducing_x=inducing_x).to(device)
@@ -354,9 +391,9 @@ def main(argv):
         model = DistMultModel(data_dim//2, num_classes).to(device)
     elif 'mlp' == FLAGS.model:
         model = FeatureExtractor(
-            data_dim=data_dim, 
-            hidden_dim=FLAGS.hidden_dim, 
-            n_layers=FLAGS.n_layers, 
+            data_dim=data_dim,
+            hidden_dim=FLAGS.hidden_dim,
+            n_layers=FLAGS.n_layers,
             final_dim=num_classes if num_classes > 2 else 1).to(device)
 
     # Go into train mode
@@ -364,7 +401,7 @@ def main(argv):
     if likelihood is not None:
         likelihood.train()
 
-     # Optimizer & LR scheduler   
+     # Optimizer & LR scheduler
     if 'dkl' == FLAGS.model:
         optimizer = torch.optim.Adam([
             {'params': model.feature_extractor.parameters(), 'weight_decay': 1e-4},
@@ -389,7 +426,13 @@ def main(argv):
             mll = torch.nn.BCEWithLogitsLoss()
         else:
             mll = torch.nn.CrossEntropyLoss()
-    
+
+    best_model_metrics = {
+        'acc': 0.0,
+        'auroc_auprc': -np.inf,
+        'loss': np.inf,
+    }
+
     with gpytorch.settings.num_likelihood_samples(1):
         for i in range(FLAGS.n_epochs):
             j = 0
@@ -406,29 +449,23 @@ def main(argv):
 
                 if 'dkl' == FLAGS.model:
                     loss = -mll(output, train_y[:, 0])
-                    pred_prob = likelihood(output).probs.mean(0)
-                    pred_label = pred_prob.argmax(-1)
-
-                    train_y_ = train_y.detach().cpu().numpy()
-                    pred_prob_ = pred_prob.detach().cpu().numpy()
-                    rel_pred_prob_ = 1.0 - pred_prob_[
-                        range(train_y_.shape[0]), train_y_.astype(np.int32).flatten()]
-
-                    train_auroc = roc_auc_score(train_y_, rel_pred_prob_)
-                    train_auprc = average_precision_score(train_y_, rel_pred_prob_)
+                    # Probability of predicting class 1
+                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                    pred_label = pred_prob.ge(0.5).float()
                 else:
                     if num_classes == 2:
                         loss = mll(output, train_y)
+                        # Probability of predicting class 1
                         pred_prob = torch.sigmoid(output)
                         pred_label = pred_prob.ge(0.5).float()
                     else:
-                        loss = mll(output, train_y.long())                    
+                        loss = mll(output, train_y.long())
                         pred_label = torch.argmax(output, -1)
 
-                    train_auroc = roc_auc_score(
-                        train_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
-                    train_auprc = average_precision_score(
-                        train_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                train_auroc = roc_auc_score(
+                    train_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                train_auprc = average_precision_score(
+                    train_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
 
                 # Train step
                 loss.backward()
@@ -445,14 +482,14 @@ def main(argv):
                     wandb.log({
                         'train_loss': loss, 'train_acc': train_acc, 'train_lr': optimizer.param_groups[0]['lr'],
                         'train_auroc': train_auroc, 'train_auprc': train_auprc})
-        
+
                 if 0 == (j % FLAGS.valid_every):
                     valid_auprc = 0.0
                     valid_auroc = 0.0
                     valid_correct = 0
                     valid_loss = 0.0
                     # all_prediction = []
-                    # all_labels = []         
+                    # all_labels = []
                     n_batches = 0
                     with torch.no_grad(), gpytorch.settings.num_likelihood_samples(16):
                         for valid_x, valid_y in valid_loader:
@@ -465,27 +502,21 @@ def main(argv):
                             output = model(valid_x)
                             if 'dkl' == FLAGS.model:
                                 valid_loss += -mll(output, valid_y[:, 0])
-                                pred_prob = likelihood(output).probs.mean(0)
-                                pred_label = pred_prob.argmax(-1)
-
-                                valid_y_ = valid_y.detach().cpu().numpy()
-                                pred_prob_ = pred_prob.detach().cpu().numpy()
-                                rel_pred_prob_ = 1.0 - pred_prob_[
-                                    range(valid_y_.shape[0]), valid_y_.astype(np.int32).flatten()]
-                                valid_auroc += roc_auc_score(valid_y_, rel_pred_prob_)
-                                valid_auprc += average_precision_score(valid_y_, rel_pred_prob_)
+                                pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                                pred_label = pred_prob.ge(0.5).float()
                             else:
                                 if num_classes == 2:
                                     valid_loss += mll(output, valid_y)
                                     pred_prob = torch.sigmoid(output)
                                     pred_label = pred_prob.ge(0.5).float()
                                 else:
-                                    valid_loss += mll(output, valid_y.long())                    
+                                    valid_loss += mll(output, valid_y.long())
                                     pred_label = torch.argmax(output, -1)
-                                valid_auroc += roc_auc_score(
-                                    valid_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
-                                valid_auprc += average_precision_score(
-                                    valid_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+
+                            valid_auroc += roc_auc_score(
+                                valid_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                            valid_auprc += average_precision_score(
+                                valid_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
                             valid_correct += pred_label.eq(valid_y.view_as(pred_label)).cpu().sum()
                             # all_logits.append(output.detach().cpu().numpy())
                             # all_labels.append(valid_y.detach().cpu().numpy())
@@ -501,10 +532,14 @@ def main(argv):
                         i + 1, j + 1, valid_loss, valid_correct.item(), len(valid_loader.dataset), valid_acc, valid_auroc, valid_auprc)
                     )
 
-                    wandb_log_dict = {'valid_loss': valid_loss, 'valid_acc': valid_acc, 
-                                      'valid_auroc': valid_auroc, 'valid_auprc': valid_auprc}
+                    # Consider saving the best model
+
+                    log_dict = {'valid_loss': valid_loss, 'valid_acc': valid_acc,
+                                'valid_auroc': valid_auroc, 'valid_auprc': valid_auprc}
+                    best_model_metrics = maybe_save(best_model_metrics, log_dict,
+                                                    ckpt_path, model, optimizer, likelihood)
                     if FLAGS.wandb_track:
-                        wandb.log(wandb_log_dict)
+                        wandb.log(log_dict)
 
                     scheduler.step(valid_loss)
 
@@ -517,7 +552,6 @@ def main(argv):
     test_auprc = 0.0
     test_auroc = 0.0
     test_correct = 0
-    test_entropy = 0.0
     test_loss = 0.0
     # all_logits = []
     # all_labels = []
@@ -534,60 +568,50 @@ def main(argv):
 
             if 'dkl' == FLAGS.model:
                 test_loss += -mll(output, test_y[:, 0])
-                pred_prob = likelihood(output).probs.mean(0)
-                pred_label = pred_prob.argmax(-1)
-
-                test_y_ = test_y.detach().cpu().numpy()
-                pred_prob_ = pred_prob.detach().cpu().numpy()
-                rel_pred_prob_ = 1.0 - pred_prob_[
-                    range(test_y_.shape[0]), test_y_.astype(np.int32).flatten()][:, np.newaxis]
+                pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                pred_label = pred_prob.ge(0.5).float()
             else:
                 if num_classes == 2:
                     test_loss += mll(output, test_y)
                     pred_prob = torch.sigmoid(output)
                     pred_label = pred_prob.ge(0.5).float()
                 else:
-                    test_loss += mll(output, test_y.long())                    
+                    test_loss += mll(output, test_y.long())
                     pred_label = torch.argmax(output, -1)
-
-                test_y_ = test_y.detach().cpu().numpy()
-                rel_pred_prob_ = pred_prob.detach().cpu().numpy()
 
             #all_logits.append(output.detach().cpu().numpy())
             #all_labels.append(test_y.detach().cpu().numpy())
 
-            test_auroc += roc_auc_score(test_y_, rel_pred_prob_)
-            test_auprc += average_precision_score(test_y_, rel_pred_prob_)
+            test_auroc += roc_auc_score(test_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+            test_auprc += average_precision_score(test_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
             correct_predictions = pred_label.eq(test_y.view_as(pred_label)).cpu().numpy()
             test_correct += correct_predictions.sum()
-            test_entropy += entropy(
-                np.concatenate([rel_pred_prob_, 1 - rel_pred_prob_], axis=1), axis=1).sum()
             n_batches += 1
 
     # Track Test loss
-    test_acc = 100. * test_correct / float(len(test_loader.dataset))  
+    test_acc = 100. * test_correct / float(len(test_loader.dataset))
     test_loss = (test_loss  / float(n_batches)).item()
     test_auroc = (test_auroc  / float(n_batches))
     test_auprc = (test_auprc  / float(n_batches))
-    test_entropy = (test_entropy  / float(len(test_loader.dataset)))
-    
-    print('{}. test loss: {:.3f} - acc: {}/{} ({:.3f}%) - auroc: {:.3f} - auprc: {:.3f} - entropy: {:.3f}'.format(
-        FLAGS.dataset, test_loss, test_correct.item(), len(test_loader.dataset), test_acc, test_auroc, test_auprc, test_entropy)
+
+    print('{}. test loss: {:.3f} - acc: {}/{} ({:.3f}%) - auroc: {:.3f} - auprc: {:.3f}'.format(
+        FLAGS.dataset, test_loss, test_correct.item(), len(test_loader.dataset), test_acc, test_auroc, test_auprc)
     )
-    wandb_log_dict = {'test_loss': test_loss, 'test_acc': test_acc, 
-                      'test_auroc': test_auroc, 'test_auprc': test_auprc,
-                      'test_entropy': test_entropy}
+    log_dict = {'test_loss': test_loss, 'test_acc': test_acc,
+                'test_auroc': test_auroc, 'test_auprc': test_auprc}
 
     if FLAGS.wandb_track:
-        wandb.log(wandb_log_dict)
-
-        fpr, tpr, _ = roc_curve(test_y_, rel_pred_prob_)
+        wandb.log(log_dict)
+        fpr, tpr, _ = roc_curve(test_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
         data = [[x, y] for (x, y) in zip(fpr, tpr)]
         table = wandb.Table(data=data, columns=["fpr", "tpr"])
         wandb.log({
             "roc_curve": wandb.plot.line(
                 table, "fpr", "tpr", title="Receiver operating characteristic")
         })
+
+        # Save all checkpoints to wandb
+        wandb.save(ckpt_path + '/*')
 
 if __name__ == '__main__':
   app.run(main)

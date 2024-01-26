@@ -2,10 +2,12 @@
 from absl import app
 from absl import flags
 
+import datetime
 import math
 import numpy as np
 import os
 import torch
+import wandb
 
 from pynvml import *
 from scipy.stats import entropy
@@ -40,21 +42,21 @@ DATA_PATH = '/n/home06/jschwarz/data/TxGNN/'
 FLAGS = flags.FLAGS
 
 # Training settings
-flags.DEFINE_integer('n_epochs', 5, 'Number of epochs.', lower_bound=1)
-flags.DEFINE_integer('n_max_steps', 10, 'Maximum number of training steps.', lower_bound=1)
+flags.DEFINE_integer('n_epochs', 1, 'Number of epochs.', lower_bound=1)
+flags.DEFINE_integer('n_max_steps', -1, 'Maximum number of training steps.', lower_bound=-1)
 flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
 flags.DEFINE_integer('eval_batch_size', 24, 'Eval Batch size.', lower_bound=1)
 
 # Model
+flags.DEFINE_enum('best_model_metric', 'loss', ['loss', 'auroc_auprc'], 'What metric to use for early stopping.')
 flags.DEFINE_enum('model', 'distilbert', ['distilbert', 'llama2_7b', 'llama2_13b'], 'Model.')
 flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora'], 'Finetunting type.')
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
 
 # Misc
 flags.DEFINE_boolean('wandb_track', False, 'Use WandB')
-flags.DEFINE_enum('dataset', 'txgnn_did', ['guanaco', 'imdb', 'txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
+flags.DEFINE_enum('dataset', 'txgnn_dod', ['guanaco', 'imdb', 'txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
-flags.DEFINE_string('checkpoint', './checkpoints/model_ckpt', 'Checkpoint location.')
 flags.DEFINE_integer('valid_every', 250, 'Validation every #steps.', lower_bound=1)
 flags.DEFINE_string('data_path', './data', 'Data location.')
 flags.DEFINE_string('exp_name', 'debug', 'Experiment name.')
@@ -85,15 +87,17 @@ def _get_gpu_utilization():
 
 def _compute_metrics(eval_pred):
     logits, labels = eval_pred
-    prediction_probs = softmax(logits, axis=1)
-    predictions = np.argmax(logits, axis=1)
+    full_pred_probs = softmax(logits, axis=1)
+    pred_probs = full_pred_probs[:, 1]
+    pred_label = np.argmax(logits, axis=1)
 
-    relevant_prediction_probs = 1.0 - prediction_probs[
+    correct_prediction_probs = 1.0 - full_pred_probs[
         range(labels.shape[0]), labels.astype(np.int32).flatten()][:, np.newaxis]
 
-    metric_dict = accuracy.compute(predictions=predictions, references=labels)
-    metric_dict['auroc'] = roc_auc_score(labels, relevant_prediction_probs)
-    metric_dict['auprc'] = average_precision_score(labels, relevant_prediction_probs)
+    metric_dict = accuracy.compute(predictions=pred_label, references=labels)
+    metric_dict['auroc'] = roc_auc_score(labels, pred_probs)
+    metric_dict['auprc'] = average_precision_score(labels, pred_probs)
+    metric_dict['auroc_auprc'] = metric_dict['auroc'] * metric_dict['auprc']
     return metric_dict
 
 
@@ -119,6 +123,9 @@ def main(argv):
     else:
         device = torch.device( "cpu")
 
+    ckpt_path = './checkpoints/finetune_llm/{}_finetune_{}/model_ckpt_{}'.format(
+        FLAGS.dataset, FLAGS.model, str(datetime.datetime.now()))
+
     #if FLAGS.wandb_track:
     #    import wandb
     #    wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model))
@@ -131,7 +138,7 @@ def main(argv):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
     elif  'llama2_13b' == FLAGS.model:
-        tokenizer = AutoTokenizer.from_pretrained('NousResearch/Llama-2-7b-hf', trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained('NousResearch/Llama-2-13b-hf', trust_remote_code=True)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
 
@@ -187,7 +194,6 @@ def main(argv):
         if FLAGS.model == 'llama2_7b':
             model_type = "NousResearch/Llama-2-7b-hf"
         elif  FLAGS.model == 'llama2_13b':
-            import pdb; pdb.set_trace()
             model_type = "NousResearch/Llama-2-13b-hf"
 
         if 'SEQ_CLS' == task_type:
@@ -245,9 +251,9 @@ def main(argv):
 
     # Set training parameters
     training_args = TrainingArguments(
-	output_dir="~/logs/huggingface",
+	output_dir=ckpt_path,
 	num_train_epochs=FLAGS.n_epochs,
-	#max_steps=FLAGS.n_max_steps,
+	max_steps=FLAGS.n_max_steps,
 	per_device_train_batch_size=FLAGS.batch_size,
 	per_device_eval_batch_size=FLAGS.eval_batch_size,
         # Optimization settings
@@ -259,8 +265,12 @@ def main(argv):
         # Logging & Validation settings
         logging_steps=25,
 	evaluation_strategy="steps",
-        eval_steps=200,
-	save_strategy="epoch",
+        eval_steps=100,
+	save_strategy="steps",
+        save_steps=100,
+        save_total_limit=2,
+        metric_for_best_model=FLAGS.best_model_metric,
+        greater_is_better=False if 'eval_loss' == FLAGS.best_model_metric else True,
 	load_best_model_at_end=False,
         # Efficiency settings
 	fp16=False,
@@ -288,7 +298,11 @@ def main(argv):
 
     # Test set evaluation
     print('Test set evaluation')
-    print(trainer.evaluate(tokenized_dataset['test']))
+    print(trainer.evaluate(tokenized_dataset['test'], metric_key_prefix='test'))
+
+    # Save best model
+    best_model_path = os.path.join(ckpt_path, FLAGS.model + '_{}'.format(FLAGS.dataset))
+    trainer.model.save_pretrained(best_model_path)
 
     # Make predictions
     if 'SEQ_CLS' == task_type:
@@ -296,11 +310,18 @@ def main(argv):
     elif 'SEQ_GEN' == task_type:
         pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer)
 
-        # Make predictions
-        pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer, max_length=200)
-        prompt = txgnn['test'][0]['text']
-        result = pipe(f"<s>[INST] {prompt} [/INST]")
-        print(result[0]['generated_text'])
+    if FLAGS.wandb_track:
+        pred_outputs = trainer.predict(tokenized_dataset['test'])
+        fpr, tpr, _ = roc_curve(pred_outputs.label_ids, torch.nn.Softmax()(torch.Tensor(pred_outputs.predictions))[:, 1].numpy())
+        data = [[x, y] for (x, y) in zip(fpr, tpr)]
+        table = wandb.Table(data=data, columns=["fpr", "tpr"])
+        wandb.log({
+            "roc_curve": wandb.plot.line(
+                table, "fpr", "tpr", title="Receiver operating characteristic")
+        })
+
+        # Save all checkpoints to wandb
+        wandb.save(best_model_path + '/*')
 
 
 if __name__ == '__main__':

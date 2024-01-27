@@ -35,7 +35,7 @@ flags.DEFINE_enum('data_split', 'random',
                   ['adrenal_gland', 'anemia', 'cardiovascular', 'cell_proliferation', 
                    'complex_disease', 'mental_health', 'random'], 'Dataset split.')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
-flags.DEFINE_string('checkpoint', './checkpoints/model_ckpt', 'Checkpoint location.')
+flags.DEFINE_string('checkpoint', './checkpoints/txgnn/model_ckpt', 'Checkpoint location.')
 flags.DEFINE_string('exp_name', 'debug', 'Experiment name.')
 
 
@@ -71,7 +71,7 @@ def main(argv):
             path_length = 2 # for protein_random_walk sim_measure, define path length
         )
 
-        path = './checkpoints/model_ckpt_{}_{}'.format(FLAGS.exp_name, str(datetime.datetime.now()))
+        path = './checkpoints/txgnn/model_ckpt_{}_{}'.format(FLAGS.exp_name, str(datetime.datetime.now()))
         kwargs = {
             'n_epoch': None, 
             'n_steps': None,

@@ -8,7 +8,7 @@ from txgnn import TxEval
 
 import datetime
 
-DATA_PATH = '/home/jos1479/data/'
+DATA_PATH = '/n/holystore01/LABS/mzitnik_lab/Users/jschwarz/TxGNNv2/data/'
 
 FLAGS = flags.FLAGS
 

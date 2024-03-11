@@ -20,7 +20,8 @@ module load miniconda3/py39_4.11.0-linux_x64-ncf
                                                                                        --dataset='txgnn_did' \
                                                                                        --n_epochs=30 \
                                                                                        --batch_size=24 \
-                                                                                       --learning_rate=2e-5 \
+                                                                                       --learning_rate=0.001 \
                                                                                        --scheduler_type='cosine_decay_with_warmup' \
+                                                                                       --valid_every=250 \
                                                                                        --weight_decay=0.01 \
                                                                                        --wandb_track=True

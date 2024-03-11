@@ -26,7 +26,8 @@ from transformers import (
 from pynvml import *
 
 from finetune_models.llm_models import *
-from data_utils import load_txgnn_dataset_text
+from finetune_models.models import *
+from data_utils import load_txgnn_dataset_text, load_txgnn_dataset_text_matrix
 
 os.environ["WANDB_PROJECT"] = "TxGNNv2"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -37,19 +38,21 @@ FLAGS = flags.FLAGS
 # Training settings
 flags.DEFINE_integer('n_epochs', 1, 'Number of epochs.', lower_bound=1)
 flags.DEFINE_integer('n_max_steps', -1, 'Maximum number of training steps.', lower_bound=-1)
-flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
-flags.DEFINE_integer('eval_batch_size', 24, 'Eval Batch size.', lower_bound=1)
+flags.DEFINE_integer('batch_size', 2, 'Finetuning Batch size.', lower_bound=1)
+flags.DEFINE_integer('eval_batch_size', 32, 'Eval Batch size.', lower_bound=1)
 
 # Model
 flags.DEFINE_enum('best_model_metric', 'loss', ['loss', 'auroc_auprc'], 'What metric to use for early stopping.')
-flags.DEFINE_enum('model', 'llama2_7b', ['distilbert', 'llama2_7b', 'llama2_13b'], 'Model.')
+flags.DEFINE_enum('model', 'dkl_llama2_7b', ['dkl_llama2_7b'], 'Model.')
 flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora'], 'Finetunting type.')
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
+flags.DEFINE_float('learning_rate', 2e-5, 'LR')
+flags.DEFINE_float('weight_decay', 1e-4, 'Weight decay for feature extractor')
 
 # Misc
 flags.DEFINE_boolean('wandb_track', False, 'Use WandB')
 flags.DEFINE_enum('dataset', 'txgnn_did', ['txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
-flags.DEFINE_boolean('dataset_use_v2', False, 'Use v2 Dataset (more negatives).')
+flags.DEFINE_boolean('full_matrix_eval', True, 'Evaluate on full matrix')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
 flags.DEFINE_integer('valid_every', 250, 'Validation every #steps.', lower_bound=1)
 flags.DEFINE_string('data_path', './data', 'Data location.')
@@ -69,9 +72,9 @@ def main(argv):
 
     tokenizer = get_tokenizer(FLAGS.model)
     tokenized_dataset, data_collator, task_type = load_txgnn_dataset_text(
-        FLAGS.dataset, FLAGS.dataset_use_v2, tokenizer)
+        FLAGS.dataset, FLAGS.seed, tokenizer)
 
-    model, use_bf16 = get_model(FLAGS.model, task_type, tokenizer)
+    model, use_bf16 = get_llm_model(FLAGS.model, task_type, tokenizer)
     model, optim = get_peft(model, task_type, FLAGS.finetune_type, FLAGS.lora_apply_everywhere)
 
     # Set training parameters
@@ -82,7 +85,7 @@ def main(argv):
 	per_device_train_batch_size=FLAGS.batch_size,
 	per_device_eval_batch_size=FLAGS.eval_batch_size,
         # Optimization settings
-	learning_rate=2e-5,
+	learning_rate=FLAGS.learning_rate,
 	weight_decay=0.01,
 	max_grad_norm=0.3,
 	lr_scheduler_type='cosine',
@@ -117,7 +120,6 @@ def main(argv):
 	data_collator=data_collator,
 	compute_metrics=compute_metrics,
     )
-    # Train model
     print('Training')
     trainer.train()
 
@@ -135,8 +137,15 @@ def main(argv):
     elif 'SEQ_GEN' == task_type:
         pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer)
 
+
     if FLAGS.wandb_track:
-        fpr, tpr, _ = roc_curve(test_pred_outputs.label_ids, torch.nn.Softmax()(torch.Tensor(test_pred_outputs.predictions))[:, 1].numpy())
+        print('Evaluating on validation and test sets')
+        valid_pred_outputs = trainer.predict(tokenized_dataset['valid'])
+        test_pred_outputs = trainer.predict(tokenized_dataset['test'])
+
+        fpr, tpr, _ = roc_curve(
+            test_pred_outputs.label_ids,
+            torch.nn.Softmax()(torch.Tensor(test_pred_outputs.predictions))[:, 1].numpy())
         data = [[x, y] for (x, y) in zip(fpr, tpr)]
         table = wandb.Table(data=data, columns=["fpr", "tpr"])
         wandb.log({
@@ -147,18 +156,24 @@ def main(argv):
         # Save all checkpoints to wandb
         wandb.save(best_model_path + '/*')
 
-        train_pred_outputs = trainer.predict(tokenized_dataset['train'])
-        valid_pred_outputs = trainer.predict(tokenized_dataset['valid'])
-        test_pred_outputs = trainer.predict(tokenized_dataset['test'])
-
         np.savez_compressed(
             os.path.join(ckpt_path, 'predictions'), 
-            train_predictions=torch.nn.Softmax()(torch.Tensor(train_pred_outputs.predictions))[:, 1].numpy(),
             valid_predictions=torch.nn.Softmax()(torch.Tensor(valid_pred_outputs.predictions))[:, 1].numpy(),
             test_predictions=torch.nn.Softmax()(torch.Tensor(test_pred_outputs.predictions))[:, 1].numpy(),
         )
-
         wandb.save(os.path.join(ckpt_path, 'predictions.npz'))
+
+        if FLAGS.full_matrix_eval:
+            print('Evaluating on matrix set')
+            tokenized_matrix_dataset, _, _ = load_txgnn_dataset_text_matrix(
+                FLAGS.dataset, tokenizer)
+            matrix_pred_outputs = trainer.predict(tokenized_matrix_dataset['matrix'])
+            np.savez_compressed(
+                os.path.join(ckpt_path, 'matrix_predictions'), 
+                matrix_predictions=torch.nn.Softmax()(torch.Tensor(matrix_pred_outputs.predictions))[:, 1].numpy(),
+            )
+            wandb.save(os.path.join(ckpt_path, 'matrix_predictions.npz'))
+
 
 
 if __name__ == '__main__':

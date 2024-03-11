@@ -253,21 +253,13 @@ class HeteroRGCN(nn.Module):
             # full batch
             if eval_pos_G is not None:
                 # eval mode
-                print('train')
-                print('write pos')
                 scores, out_pos = self.pred(eval_pos_G, G, h, pretrain_mode, mode = mode + '_pos')
-                print('write neg')
                 scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg')
-                import pdb; pdb.set_trace()
                 return scores, scores_neg, out_pos, out_neg
             else:
                 # train mode
-                print('train')
-                print('write pos')
                 scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos')
-                print('write neg')
                 scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg')
-                import pdb; pdb.set_trace()
                 return scores, scores_neg, out_pos, out_neg
     
     def graphmask_forward(self, G, pos_graph, neg_graph, graphmask_mode = False, return_gates = False, only_relation = None):

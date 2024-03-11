@@ -11,10 +11,14 @@ from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
+    LlamaForSequenceClassification,
+    LlamaConfig,
     AutoTokenizer,
     BitsAndBytesConfig,
     pipeline,
 )
+from .dkl_llama import LlamaForDKLSequenceClassification
+from .models import FeatureExtractor
 from peft import LoraConfig
 
 accuracy = evaluate.load("accuracy")
@@ -24,6 +28,8 @@ LABEL2ID = {"NEGATIVE": 0, "POSITIVE": 1}
 
 
 CACHE_PATH = '/n/holyscratch01/mzitnik_lab/jschwarz/cache/'
+# Only use this in case of any network problems
+#CACHE_PATH = '/n/home06/jschwarz/cache'
 
 
 def _get_gpu_utilization():
@@ -51,15 +57,16 @@ def compute_metrics(eval_pred):
 
 def get_tokenizer(model_type):
     # Load relevant tokenizer
-    if 'distilbert' == model_type:
+    if 'distilbert' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'distilbert-base-uncased', cache_dir=CACHE_PATH)
-    elif  'llama2_7b' == model_type:
+        tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+    elif  'llama2_7b' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'NousResearch/Llama-2-7b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
-    elif  'llama2_13b' == model_type:
+    elif  'llama2_13b'in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'NousResearch/Llama-2-13b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
         tokenizer.pad_token = tokenizer.eos_token
@@ -68,7 +75,7 @@ def get_tokenizer(model_type):
     return tokenizer
 
 
-def get_model(model_type, task_type, tokenizer):
+def get_llm(model_type, task_type, tokenizer):
     # Load the entire model on the GPU 0
     device_map = {"": 0}
     use_bf16 = False
@@ -101,21 +108,32 @@ def get_model(model_type, task_type, tokenizer):
             bnb_4bit_use_double_quant=False,
         )
 
-        if model_type == 'llama2_7b':
+        if'llama2_7b' in model_type:
             model_name = "NousResearch/Llama-2-7b-hf"
-        elif  model_type == 'llama2_13b':
+        elif'llama2_13b' in model_type:
             model_name = "NousResearch/Llama-2-13b-hf"
 
         if 'SEQ_CLS' == task_type:
-            model = AutoModelForSequenceClassification.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map=device_map,
-                num_labels=2,
-                id2label=ID2LABEL,
-                label2id=LABEL2ID,
-                cache_dir=CACHE_PATH,
-            )
+            if 'dkl' in model_type:
+                model = LlamaForDKLSequenceClassification.from_pretrained(
+                    model_name,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    cache_dir=CACHE_PATH,
+                    num_labels=2,
+                    id2label=ID2LABEL,
+                    label2id=LABEL2ID,
+                )
+            else:
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    model_name,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    num_labels=2,
+                    id2label=ID2LABEL,
+                    label2id=LABEL2ID,
+                    cache_dir=CACHE_PATH,
+                )
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -140,7 +158,7 @@ def get_model(model_type, task_type, tokenizer):
     return model, use_bf16
 
 
-def get_peft(model, task_type, finetune_type, lora_apply_everywhere):
+def get_peft(model, task_type, finetune_type, lora_apply_everywhere, use_final_layer=True):
     optim = 'adamw_torch'
     if 'lora' in finetune_type:
 
@@ -150,8 +168,10 @@ def get_peft(model, task_type, finetune_type, lora_apply_everywhere):
             'lora_dropout': 0.1,
             'r': 64,
             'bias': "none",
-            'modules_to_save': ["score"],
+            #  'modules_to_save': ["score"],
         }
+        if use_final_layer:
+            kwargs['modules_to_save'] = "score"
         if not lora_apply_everywhere:
             kwargs['target_modules'] = ["q_proj", "k_proj", "v_proj"]  # "out_proj", "fc_in", "fc_out", "wte"]
 
@@ -164,3 +184,11 @@ def get_peft(model, task_type, finetune_type, lora_apply_everywhere):
         model.add_adapter(peft_config)
 
     return model, optim
+
+
+def get_fromage_adapter(data_dim, hidden_dim, n_layers, final_dim, device):
+    return FeatureExtractor(
+        data_dim=data_dim,
+        hidden_dim=hidden_dim,
+        n_layers=n_layers,
+        final_dim=final_dim).to(device)

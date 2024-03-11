@@ -4,7 +4,7 @@ import torch
 
 from gpytorch.models import ApproximateGP
 from gpytorch.variational import CholeskyVariationalDistribution
-from gpytorch.variational import GridInterpolationVariationalStrategy, UnwhitenedVariationalStrategy
+from gpytorch.variational import GridInterpolationVariationalStrategy, UnwhitenedVariationalStrategy 
 
 
 class FeatureExtractor(torch.nn.Sequential):
@@ -33,8 +33,8 @@ class DistMultModel(torch.nn.Sequential):
             self.W = torch.nn.Parameter(torch.Tensor(data_dim))
             torch.nn.init.zeros_(self.W)
 
-    def forward(self, x):
-        h_u, h_v = x.split(self.data_dim, dim=1)
+    def forward(self, input):
+        h_u, h_v = input.split(self.data_dim, dim=1)
         if self.num_classes  > 2:
             res = (h_u.unsqueeze(-1) * self.W * h_v.unsqueeze(-1)).sum(dim=1)
         else:
@@ -79,45 +79,54 @@ class GPClassificationModel(ApproximateGP):
         self.mean_module = gpytorch.means.ConstantMean()
 
 
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
+    def forward(self, input):
+        mean_x = self.mean_module(input)
+        covar_x = self.covar_module(input)
         latent_pred = gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
         return latent_pred
 
 
 class DKLModel(gpytorch.Module):
-    def __init__(self, feature_extractor, strategy, num_dim, grid_bounds=(-10., 10.),
-                 inducing_x=None):
+    def __init__(self, strategy, num_dim, grid_bounds=(-10., 10.), grid_size=64,
+                 inducing_x=None, feature_extractor=None):
         super(DKLModel, self).__init__()
         self.feature_extractor = feature_extractor
         self.gp_layer = GPClassificationModel(
-            strategy=strategy, num_dim=num_dim, grid_bounds=grid_bounds, inducing_x=inducing_x)
+            strategy=strategy, num_dim=num_dim, grid_size=grid_size,
+            grid_bounds=grid_bounds, inducing_x=inducing_x)
         self.grid_bounds = grid_bounds
         self.num_dim = num_dim
 
         # This module will scale the NN features so that they're nice values
         self.scale_to_bounds = gpytorch.utils.grid.ScaleToBounds(self.grid_bounds[0], self.grid_bounds[1])
 
-    def forward(self, x):
-        features = self.feature_extractor(x)
-        features = self.scale_to_bounds(features)
+    def forward(self, input):
+        if self.feature_extractor is not None:
+            input = self.feature_extractor(input)
+
+        input = self.scale_to_bounds(input)
         # This next line makes it so that we learn a GP for each feature
-        features = features.transpose(-1, -2).unsqueeze(-1)
-        res = self.gp_layer(features)
+        input = input.transpose(-1, -2).unsqueeze(-1)
+        res = self.gp_layer(input)
         return res
 
+
 def get_model(model_type, data_dim, num_classes, hidden_dim, n_layers, final_dim,
-              strategy, inducing_x, device):
+              strategy, inducing_x, device, use_feature_extractor=True):
     likelihood = None
-    if 'dkl' == model_type:
+    if 'dkl' in model_type:
         # Initialize model and likelihood
-        feature_extractor = FeatureExtractor(
-            data_dim=data_dim,
-            hidden_dim=hidden_dim,
-            n_layers=n_layers,
-            final_dim=final_dim).to(device)
-        model = DKLModel(feature_extractor, strategy=strategy,
+        if use_feature_extractor:
+            feature_extractor = FeatureExtractor(
+                data_dim=data_dim,
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+                final_dim=final_dim).to(device)
+        else:
+            feature_extractor = None
+            final_dim = data_dim
+
+        model = DKLModel(feature_extractor=feature_extractor, strategy=strategy,
                          num_dim=final_dim, inducing_x=inducing_x).to(device)
         likelihood = gpytorch.likelihoods.SoftmaxLikelihood(
                 num_features=model.num_dim, num_classes=num_classes).to(device)

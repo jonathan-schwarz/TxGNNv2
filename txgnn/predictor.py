@@ -296,6 +296,7 @@ class DistMultPredictor(nn.Module):
                             h[src][src_rel_idx] = proto_emb_src
                             h[dst][dst_rel_idx] = proto_emb_dst
                         graph.ndata['h'] = h
+                    import pdb; pdb.set_trace()
                     graph.apply_edges(self.apply_edges, etype=etype)   
                     # Sigmoid is taken in `TxGNN.py`
                     out = graph.edges[etype].data['score']

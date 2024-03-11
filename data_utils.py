@@ -3,11 +3,14 @@ import numpy as np
 import torch
 import os
 
-from datasets import load_dataset, Dataset, DatasetDict
 
+from datasets import load_dataset, Dataset, DatasetDict
 from transformers import DataCollatorWithPadding
 
+from finetune_models.llm_models import get_tokenizer
+
 DATA_PATH = '/n/holystore01/LABS/mzitnik_lab/Users/jschwarz/TxGNNv2/data/pretrained_mine/'
+DATASET_VERSION = 'complex_disease_matrix'
 
 FILE_NAMES = {
     'did': 'drug_indication_disease',
@@ -18,32 +21,34 @@ FILE_NAMES = {
     'drcd': 'disease_rev_contraindication_drug',
 }
 
+MAX_LENGTH = 65
+
 
 def load_split(outfile, mode, merge_str):
 
-    train_u_names = outfile[mode + '_u_names']
-    train_v_names = outfile[mode + '_v_names']
-    train_text = np.concatenate([train_u_names, train_v_names], axis=1)
-    train_labels = outfile[mode + '_labels']
+    u_names = outfile[mode + '_u_names']
+    v_names = outfile[mode + '_v_names']
+    try:
+        text = np.concatenate([u_names, v_names], axis=1)
+    except:
+        text = np.concatenate(
+            [u_names[:, np.newaxis], v_names[:, np.newaxis]], axis=1)
+    labels = outfile[mode + '_labels']
 
-    train_text = [merge_str.format(train_text[i][0], train_text[i][1]) for i in range(train_text.shape[0])]
-    train_dict = {
-        'text': train_text,
-        'label': train_labels.astype(np.int32)[:, 0].tolist(),
+    text = [merge_str.format(text[i][0], text[i][1]) for i in range(text.shape[0])]
+    dict = {
+        'text': text,
+        'label': labels.astype(np.int64)[:, 0].tolist(),
     }
-    dataset = Dataset.from_dict(train_dict)
+    dataset = Dataset.from_dict(dict)
 
     return dataset
 
-def load_txgnn_dataset_text(dataset, dataset_use_v2, tokenizer):
-    if dataset_use_v2:
-        path = os.path.join(
-            DATA_PATH, 'complex_disease_v2/separate/{}.npz')
-    else:
-        path = os.path.join(
-            DATA_PATH, 'complex_disease/separate/{}.npz')
 
-    data = np.load(path.format(FILE_NAMES[dataset.split('_')[1]]))
+def load_txgnn_dataset_text(dataset, tokenizer):
+    path = os.path.join(DATA_PATH, '{}/separate/{}.npz')
+    data = np.load(path.format(
+        DATASET_VERSION, FILE_NAMES[dataset.split('_')[1]]))
 
     if 'did' in dataset:
         merge_str = 'Is {} an effective treatment for {}?'
@@ -61,7 +66,8 @@ def load_txgnn_dataset_text(dataset, dataset_use_v2, tokenizer):
     )
 
     def _preprocess_function(examples):
-        return tokenizer(examples["text"], truncation=True, padding=True)
+        # return tokenizer(examples["text"], truncation=True, padding=True)
+        return tokenizer(examples["text"], truncation=True, max_length=MAX_LENGTH, pad_to_max_length=True)
 
     tokenized_dataset = full_dataset.map(_preprocess_function, batched=True)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -70,49 +76,188 @@ def load_txgnn_dataset_text(dataset, dataset_use_v2, tokenizer):
     return tokenized_dataset, data_collator, task_type
 
 
-def load_txgnn_dataset_embedding(dataset, batch_size, dataset_use_v2, device):
-    if dataset_use_v2:
-        path = os.path.join(
-            DATA_PATH, 'complex_disease_v2/separate/{}.npz')
-    else:
-        path = os.path.join(
-            DATA_PATH, 'complex_disease/separate/{}.npz')
+def load_txgnn_dataset_text_matrix(dataset, tokenizer):
+    path = os.path.join(DATA_PATH, '{}/matrix/test_matrix_{}.npz')
+    outfile = np.load(path.format(
+        'complex_disease_matrix', FILE_NAMES[dataset.split('_')[1]]))
 
-    data = np.load(path.format(FILE_NAMES[dataset.split('_')[1]]))
+    if 'did' in dataset:
+        merge_str = 'Is {} an effective treatment for {}?'
+    elif 'dod' in dataset:
+        merge_str = 'Is {} effective for off-label use on {}?'
+    elif 'dcd' in dataset:
+        merge_str = 'Should {} be avoided for patients suffering from {}?'
+    else:
+        assert False, 'Reverse cases not yet supported'
+
+    u_names = outfile['u_names']
+    v_names = outfile['v_names']
+    try:
+        text = np.concatenate([u_names, v_names], axis=1)
+    except:
+        text = np.concatenate(
+            [outfile['u_names'][:, np.newaxis],
+             outfile['v_names'][:, np.newaxis]], axis=1)
+
+    text = [merge_str.format(text[i][0], text[i][1]) for i in range(text.shape[0])]
+    full_dataset = DatasetDict(
+        {'matrix': Dataset.from_dict({'text': text})},
+    )
+
+    def _preprocess_function(examples):
+        return tokenizer(examples["text"], truncation=True, max_length=MAX_LENGTH, pad_to_max_length=True)
+
+    tokenized_dataset = full_dataset.map(_preprocess_function, batched=True)
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    task_type = "SEQ_CLS"
+
+    return tokenized_dataset, data_collator, task_type
+
+
+def load_txgnn_dataset_raw(dataset, device):
+    path = os.path.join(DATA_PATH, '{}/separate/{}.npz')
+    data = np.load(path.format(
+        DATASET_VERSION, FILE_NAMES[dataset.split('_')[1]]))
 
     train_x = torch.Tensor(np.concatenate(
         [data['train_h_u'], data['train_h_v']], axis=1)).to(device)
     train_y = torch.Tensor(data['train_labels']).to(device)
-    train_names = np.concatenate(
-        [data['train_u_names'], data['train_v_names']], axis=1)
-    train_set = torch.utils.data.TensorDataset(train_x, train_y)
+    try:
+        train_names = np.concatenate(
+            [data['train_u_names'], data['train_v_names']], axis=1)
+    except:
+        train_names = np.concatenate(
+            [data['train_u_names'][:, np.newaxis],
+             data['train_v_names'][:, np.newaxis]], axis=1)
 
     valid_x = torch.Tensor(np.concatenate(
         [data['valid_h_u'], data['valid_h_v']], axis=1)).to(device)
     valid_y = torch.Tensor(data['valid_labels']).to(device)
-    valid_names = np.concatenate(
-        [data['valid_u_names'], data['valid_v_names']], axis=1)
-    valid_set = torch.utils.data.TensorDataset(valid_x, valid_y)
+    try:
+        valid_names = np.concatenate(
+            [data['valid_u_names'], data['valid_v_names']], axis=1)
+    except:
+        valid_names = np.concatenate(
+            [data['valid_u_names'][:, np.newaxis],
+             data['valid_v_names'][:, np.newaxis]], axis=1)
 
     test_x = torch.Tensor(np.concatenate(
         [data['test_h_u'], data['test_h_v']], axis=1)).to(device)
     test_y = torch.Tensor(data['test_labels']).to(device)
-    test_names = np.concatenate(
-        [data['test_u_names'], data['test_v_names']], axis=1)
-    test_set = torch.utils.data.TensorDataset(test_x, test_y)
+    try:
+        test_names = np.concatenate(
+            [data['test_u_names'], data['test_v_names']], axis=1)
+    except:
+        test_names = np.concatenate(
+            [data['test_u_names'][:, np.newaxis],
+             data['test_v_names'][:, np.newaxis]], axis=1)
 
-    data_dim = train_x.shape[1]
+    return (train_x, train_y, train_names), (valid_x, valid_y, valid_names), (test_x, test_y, test_names)
+
+
+def load_txgnn_dataset(dataset, dataset_type, model, batch_size, device):
+    # Format: (features, labels, drug/disease names)
+    train, valid, test = load_txgnn_dataset_raw(dataset, device)
+
+    # Pretrained GNN features
+    data_dim = train[0].shape[1]
     num_classes = 2
-    num_valid_points = valid_x.shape[0]
-    num_test_points = test_x.shape[0]
+    num_train_points = train[0].shape[0]
+    num_valid_points = valid[0].shape[0]
+    num_test_points = test[0].shape[0]
+    # Currently unused
     inducing_x = None
 
-    train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=batch_size, shuffle=True)
-    num_train_points = len(train_loader.dataset)
-    valid_loader = torch.utils.data.DataLoader(
-        valid_set, batch_size=num_valid_points, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(
-        test_set, batch_size=num_test_points, shuffle=False)
+    if dataset_type == 'embedding':
+        tokenizer = None  # Unused
 
-    return train_loader, valid_loader, test_loader, num_train_points, data_dim, num_classes, inducing_x
+        train_set = torch.utils.data.TensorDataset(train[0], train[1])
+        train_loader = torch.utils.data.DataLoader(
+            train_set, batch_size=batch_size, shuffle=True)
+        valid_set = torch.utils.data.TensorDataset(valid[0], valid[1])
+        valid_loader = torch.utils.data.DataLoader(
+            valid_set, batch_size=num_valid_points, shuffle=False)
+        test_set = torch.utils.data.TensorDataset(test[0], test[1])
+        test_loader = torch.utils.data.DataLoader(
+            test_set, batch_size=num_test_points, shuffle=False)
+    elif dataset_type == 'embedding_text':
+        # LLM input
+        tokenizer = get_tokenizer(model)
+        tokenized_dataset, _, task_type = load_txgnn_dataset_text(
+            dataset, tokenizer)
+
+
+        def _build_dataset(gnn_features, labels, _tokenized_dataset):
+            # TODO(schwarzjn): Fix code to avoid `drop_last`
+            tensor_dataset =  torch.utils.data.TensorDataset(
+                gnn_features,  # GNN features
+                torch.Tensor(_tokenized_dataset['input_ids']).long(),
+                torch.Tensor(_tokenized_dataset['attention_mask']).long(), labels)
+
+            # We are shuffling in all cases to avoid ROC computation errors
+            return torch.utils.data.DataLoader(
+                tensor_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+        train_loader = _build_dataset(train[0], train[1], tokenized_dataset['train'])
+        valid_loader = _build_dataset(valid[0], valid[1], tokenized_dataset['valid'])
+        test_loader = _build_dataset(test[0], test[1], tokenized_dataset['test'])
+
+    return train_loader, valid_loader, test_loader, num_train_points, data_dim, num_classes, inducing_x, tokenizer
+
+
+def load_txgnn_dataset_matrix(dataset, dataset_type, model, batch_size, device):
+    path = os.path.join(DATA_PATH, '{}/matrix/test_matrix_{}.npz')
+    data = np.load(path.format(
+        'complex_disease_matrix', FILE_NAMES[dataset.split('_')[1]]))
+
+    matrix_x = torch.Tensor(np.concatenate(
+        [data['h_u'], data['h_v']], axis=1)).to(device)
+
+    if dataset_type == 'embedding':
+        matrix_set = torch.utils.data.TensorDataset(matrix_x)
+        matrix_loader = torch.utils.data.DataLoader(
+            matrix_set, batch_size=batch_size, shuffle=True)
+        num_matrix_points = len(matrix_loader.dataset)
+    elif dataset_type == 'embedding_text':
+        # LLM input
+        tokenizer = get_tokenizer(model)
+        tokenized_dataset, _, task_type = load_txgnn_dataset_text_matrix(
+            dataset, tokenizer)
+
+        matrix_set = torch.utils.data.TensorDataset(
+            matrix_x,
+            torch.Tensor(tokenized_dataset['matrix']['input_ids']).long(),
+            torch.Tensor(tokenized_dataset['matrix']['attention_mask']).long())
+        matrix_loader =  torch.utils.data.DataLoader(
+            matrix_set, batch_size=batch_size, shuffle=True, drop_last=True)
+        num_matrix_points = len(matrix_loader.dataset)
+
+    return matrix_loader, num_matrix_points
+
+
+def assemble_batch(batch, model_type, use_fromage, device, return_labels=True):
+    if 'llama' in model_type:
+        model_input = {
+            'input_ids': batch[1].to(device),
+            'attention_mask': batch[2].to(device),
+        }
+        if return_labels:
+            labels = batch[3].to(device)
+
+        if use_fromage:
+            model_input['gnn_embeddings'] = batch[0].to(device)
+    else:
+        train_x = batch[0].to(device)
+        if return_labels:
+            labels = batch[1].to(device)
+
+        # Make compatible with MLP
+        train_x = train_x.view(train_x.size(0), -1)
+        model_input = {
+            'input': train_x,
+        }
+
+    if return_labels:
+        return model_input, labels
+    else:
+        return model_input

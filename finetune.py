@@ -3,6 +3,7 @@ from absl import app
 from absl import flags
 
 import datetime
+import functools
 import gpytorch
 import math
 import numpy as np
@@ -10,64 +11,71 @@ import os
 import torch
 import wandb
 
+from data_utils import *
+from finetune_models.models import *
+from finetune_models.llm_models import *
+from train_utils import *
+
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
-from finetune_models.models import *
-from data_utils import load_txgnn_dataset_embedding
 
 FLAGS = flags.FLAGS
 
 # Training settings
 flags.DEFINE_integer('n_epochs', 1, 'Number of epochs.', lower_bound=1)
-flags.DEFINE_integer('batch_size', 128, 'Finetuning Batch size.', lower_bound=1)
+flags.DEFINE_integer('n_max_steps', -1, 'Maximum number of training steps.', lower_bound=-1)
+flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
+
 
 # Model
 flags.DEFINE_boolean('use_feature_extractor', True, 'DKL')
-flags.DEFINE_enum('model', 'dkl', ['dkl', 'mlp', 'distmult'], 'Model.')
-flags.DEFINE_enum('strategy', 'grid_interpolation',
-                  ['grid_interpolation', 'unwhitened'], 'Variational Strategy.')
+flags.DEFINE_enum('model', 'dkl', ['dkl', 'dkl_llama2_7b', 'mlp', 'distmult'], 'Model.')
 flags.DEFINE_float('learning_rate', 0.01, 'LR')
 flags.DEFINE_float('weight_decay', 1e-4, 'Weight decay for feature extractor')
-flags.DEFINE_enum('scheduler', 'valid_plateau', ['train_plateau', 'multi_step_lr', 'valid_plateau'], 'LR Scheduler.')
+flags.DEFINE_enum('scheduler_type', 'cosine_decay_with_warmup', ['cosine_decay', 'cosine_decay_with_warmup', 'multi_step_lr', 'valid_plateau'], 'LR Scheduler.')
 flags.DEFINE_integer('grid_size', 64, 'DKL Grid size', lower_bound=2)
 flags.DEFINE_integer('final_dim', 256, 'DKL Final Dim.', lower_bound=1)
 flags.DEFINE_integer('hidden_dim', 256, 'DKL Hidden Dim.', lower_bound=1)
-flags.DEFINE_integer('n_inducing', 100, 'Number of inducing points.', lower_bound=1)
 flags.DEFINE_integer('n_layers', 3, 'DKL Hidden Layers.', lower_bound=1)
+# Only for LLMs
+flags.DEFINE_boolean('use_fromage', True, 'Whether to use GNN features in LLM predictive model.')
+flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
+flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora'], 'Finetunting type.')
+# Only for DKL
+flags.DEFINE_enum('strategy', 'grid_interpolation',
+                  ['grid_interpolation', 'unwhitened'], 'Variational Strategy.')
+flags.DEFINE_boolean('wandb_track', False, 'Whether to use wandb.')
 
 
 # Misc
-flags.DEFINE_boolean('wandb_track', False, 'Use WandB')
+flags.DEFINE_string('checkpoint', './checkpoints/finetune/model_ckpt', 'Checkpoint location.')
+flags.DEFINE_string('data_path', './data', 'Data location.')
 # Valid choices are ['did', 'dod', 'dcd', 'drid', 'drod', 'drcd']
 flags.DEFINE_enum('dataset', 'txgnn_dod', ['txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
-flags.DEFINE_boolean('dataset_use_v2', False, 'Use v2 Dataset (more negatives).')
+flags.DEFINE_boolean('full_matrix_eval', True, 'Evaluate on full matrix')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
-flags.DEFINE_string('checkpoint', './checkpoints/finetune/model_ckpt', 'Checkpoint location.')
 flags.DEFINE_integer('valid_every', 25, 'Validation every #steps.', lower_bound=1)
-flags.DEFINE_string('data_path', './data', 'Data location.')
 
 
-def maybe_save(best_model_metrics, model_metrics, ckpt_path, model, optimizer, likelihood):
+def maybe_save(best_model_metrics, model_metrics, ckpt_path, model, optimizer, llm_state_dict=None, likelihood=None):
     for k, v in best_model_metrics.items():
         if 'auroc_auprc' == k:
             new_metric = model_metrics['valid_auroc'] * model_metrics['valid_auprc']
             do_save = new_metric > v
-        elif 'loss' == k:
-            new_metric = model_metrics['valid_loss']
-            do_save = new_metric < v
-        elif 'acc' == k:
-            new_metric = model_metrics['valid_acc']
-            do_save = new_metric > v
+        else:
+            continue
 
         if do_save:
             print("Saving new best model with metric '{}'. New: {:.3f} Old: {:.3f}".format(k, new_metric, v))
-            save_model(ckpt_path, k, model, optimizer, likelihood)
+            save_model(ckpt_path, k, model, optimizer, llm_state_dict, likelihood)
             best_model_metrics[k] = new_metric
 
     return best_model_metrics
 
 
-def save_model(path, metric_name, model, optimizer, likelihood=None):
+def save_model(path, metric_name, model, optimizer, llm_state_dict=None, likelihood=None):
+
+    print('Saving checkpoint to {}'.format(path))
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
 
@@ -77,6 +85,9 @@ def save_model(path, metric_name, model, optimizer, likelihood=None):
          'model_state_dict': model.state_dict(),
          'optimizer_state_dict': optimizer.state_dict(),
     }
+
+    if llm_state_dict is not None:
+        save_dict['llm_state_dict'] = llm_state_dict
     if likelihood is not None:
         save_dict['likelihood_state_dict'] = likelihood.state_dict()
 
@@ -84,6 +95,10 @@ def save_model(path, metric_name, model, optimizer, likelihood=None):
 
 
 def main(argv):
+    # Fix random seed
+    torch.manual_seed(FLAGS.seed)
+    torch.cuda.manual_seed(FLAGS.seed)
+    np.random.seed(FLAGS.seed)
 
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
@@ -96,53 +111,83 @@ def main(argv):
     if FLAGS.wandb_track:
         wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model))
 
+    # Load data from pretrained GNN
+    dataset_type = 'embedding_text' if 'llama' in FLAGS.model else 'embedding'
     (train_loader, valid_loader, test_loader,
-      num_train_points, data_dim, num_classes, inducing_x) = load_txgnn_dataset_embedding(
-        FLAGS.dataset, FLAGS.batch_size, FLAGS.dataset_use_v2, device,
+      num_train_points, data_dim, num_classes, inducing_x, tokenizer) = load_txgnn_dataset(
+        FLAGS.dataset, dataset_type, FLAGS.model, FLAGS.batch_size, device
     )
 
+    _assemble_batch = functools.partial(assemble_batch,
+                                        model_type=FLAGS.model,
+                                        use_fromage=FLAGS.use_fromage,
+                                        device=device)
+
+    # Build model
+    if 'llama' in FLAGS.model:
+        # llama embedding dimension
+        data_dim = 4096
+
+        # Language Model
+        llm, use_bf16 = get_llm(FLAGS.model, 'SEQ_CLS', tokenizer)
+        llm, optim = get_peft(
+            llm, 'SEQ_CLS', FLAGS.finetune_type, FLAGS.lora_apply_everywhere,
+            use_final_layer=False)
+
+        if FLAGS.use_fromage:
+            # Adapter for GNN features
+            gnn_data_dim = 1024
+            fromage_adapter = get_fromage_adapter(
+                gnn_data_dim // 2, FLAGS.hidden_dim, FLAGS.n_layers, data_dim, llm.device)
+    else:
+        llm = None
+
+
+    # Predictive model
     model, likelihood = get_model(
         FLAGS.model, data_dim, num_classes,
         FLAGS.hidden_dim, FLAGS.n_layers, FLAGS.final_dim,
-        FLAGS.strategy, inducing_x, device)
+        FLAGS.strategy, inducing_x, device, FLAGS.use_feature_extractor)
 
     # Go into train mode
     model.train()
     if likelihood is not None:
         likelihood.train()
+    if llm is not None:
+        llm.train()
 
      # Optimizer & LR scheduler
-    if 'dkl' == FLAGS.model:
-        optimizer = torch.optim.Adam([
-            {'params': model.feature_extractor.parameters(), 'weight_decay': 1e-4},
+    llm_state_dict = None
+    if 'dkl' in FLAGS.model:
+        params = [
             {'params': model.gp_layer.hyperparameters(), 'lr': FLAGS.learning_rate * 0.01},
             {'params': model.gp_layer.variational_parameters()},
             {'params': likelihood.parameters()},
-        ], lr=FLAGS.learning_rate)
-    else:
-        params = [v for v in model.parameters()]
-        optimizer = torch.optim.Adam(params, lr=FLAGS.learning_rate)
+        ]   
+        if 'llama2_7b' in FLAGS.model:
+            llm_state_dict = get_trainable_parameters(llm)
 
-    if 'train_plateau' == FLAGS.scheduler:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.9, patience=25)
-    elif 'valid_plateau' == FLAGS.scheduler:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.9, patience=5)
-    elif 'multi_step_lr' == FLAGS.scheduler:
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=[0.25 * FLAGS.n_epochs, 0.5 * FLAGS.n_epochs, 0.75 * FLAGS.n_epochs], gamma=0.1)
+            # Needs special handling so we only save PEFT parameters
+            params.append({'params': [v for k, v in llm_state_dict.items()], 'weight_decay': FLAGS.weight_decay})
+            if FLAGS.use_fromage:
+                params.append({'params': fromage_adapter.parameters()})
+        if FLAGS.use_feature_extractor:
+            params.append({'params': model.feature_extractor.parameters(), 'weight_decay': FLAGS.weight_decay})
+    else:
+        llm_state_dict = None
+        params = [v for v in model.parameters()]
+
+    optimizer = torch.optim.Adam(params, lr=FLAGS.learning_rate)
+    scheduler = load_scheduler(FLAGS.scheduler_type, optimizer, FLAGS.n_epochs, 
+                               num_train_points // FLAGS.batch_size)
 
     # "Loss" for GPs - the marginal log likelihood
     # num_data refers to the number of training datapoints
-    if 'dkl' == FLAGS.model:
-        mll = gpytorch.mlls.VariationalELBO(
-            likelihood, model.gp_layer, num_data=num_train_points)
+    if 'dkl' in FLAGS.model:
+        loss_fn = gpytorch.mlls.VariationalELBO(
+                likelihood, model.gp_layer, num_data=num_train_points)
     else:
-        if num_classes == 2:
-            mll = torch.nn.BCEWithLogitsLoss()
-        else:
-            mll = torch.nn.CrossEntropyLoss()
+        loss_fn = torch.nn.BCEWithLogitsLoss()
 
     best_model_metrics = {
         'acc': 0.0,
@@ -150,49 +195,68 @@ def main(argv):
         'loss': np.inf,
     }
 
+    step = 0
     with gpytorch.settings.num_likelihood_samples(1):
         for i in range(FLAGS.n_epochs):
             j = 0
-            for train_x, train_y in train_loader:
-                if torch.cuda.is_available():
-                    train_x, train_y = train_x.cuda(), train_y.cuda()
-                    # Make compatible with MLP
-                    train_x = train_x.view(train_x.size(0), -1)
 
+            for batch in train_loader:
                 optimizer.zero_grad()
 
-                # Get predictive output
-                output = model(train_x)
+                model_input, labels = _assemble_batch(batch)
 
                 if 'dkl' == FLAGS.model:
-                    loss = -mll(output, train_y[:, 0])
+                    # Get predictive output
+                    output = model(**model_input)
+                    loss = -loss_fn(output, labels[:, 0])
+
                     # Probability of predicting class 1
                     pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                    pred_label = pred_prob.ge(0.5).float()
-                else:
-                    if num_classes == 2:
-                        loss = mll(output, train_y)
-                        # Probability of predicting class 1
-                        pred_prob = torch.sigmoid(output)
-                        pred_label = pred_prob.ge(0.5).float()
-                    else:
-                        loss = mll(output, train_y.long())
-                        pred_label = torch.argmax(output, -1)
+                elif 'dkl_llama2_7b' == FLAGS.model:
+        
+                    if FLAGS.use_fromage:
+                        # Embedding each drug / disease feature separately
+                        # TODO(schwarzjn): Should we process drug/disease embedding separately?
+                        fromage_features = fromage_adapter(
+                            model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
+                        ).reshape([FLAGS.batch_size, 2, data_dim])
+                        model_input['gnn_embeddings'] = fromage_features
 
-                train_auroc = roc_auc_score(
-                    train_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
-                train_auprc = average_precision_score(
-                    train_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                    # Apply LLM
+                    llm_output = llm(**model_input)
+                    # Apply GP
+                    output = model(llm_output)
+                    loss = -loss_fn(output, labels[:, 0])
+
+                    # Probability of predicting class 1
+                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                else:
+                    # Get predictive output
+                    output = model(**model_input)
+                    loss = loss_fn(output, labels)
+
+                    # Probability of predicting class 1
+                    pred_prob = torch.sigmoid(output)
+
+                pred_label = pred_prob.ge(0.5).float()
+                try:
+                    # TODO(schwarzjn): Fix error when we have only positive/only negative examples
+                    train_auroc = roc_auc_score(
+                        labels.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                    train_auprc = average_precision_score(
+                        labels.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                except:
+                    pass
 
                 # Train step
                 loss.backward()
                 optimizer.step()
 
-                if 'train_plateau' == FLAGS.scheduler:
-                    scheduler.step(loss)
+                if 'valid_plateau' != FLAGS.scheduler_type:
+                    scheduler.step()
 
                 # Metrics
-                train_correct = pred_label.eq(train_y.view_as(pred_label)).cpu().sum()
+                train_correct = pred_label.eq(labels.view_as(pred_label)).cpu().sum()
                 train_acc = train_correct / FLAGS.batch_size
 
                 print('Epoch/Iter: {}/{} - Train Loss: {:.3f} - Acc: {:.3f} - AUROC: {:.3f} - AUPRC: {:.3f}'.format(
@@ -209,33 +273,52 @@ def main(argv):
                     valid_correct = 0
                     valid_loss = 0.0
                     n_batches = 0
+                    valid_predictions = [] 
+                    # This gives us 16 samples from the predictive distribution (for a GP)
                     with torch.no_grad(), gpytorch.settings.num_likelihood_samples(16):
-                        for valid_x, valid_y in valid_loader:
-                            if torch.cuda.is_available():
-                                valid_x, valid_y = valid_x.cuda(), valid_y.cuda()
-                                # Make compatible with MLP
-                                valid_x = valid_x.view(valid_x.size(0), -1)
+                        for valid_batch in valid_loader:
+                            model_input, labels = _assemble_batch(valid_batch)
 
-                            # This gives us 16 samples from the predictive distribution (for a GP)
-                            output = model(valid_x)
                             if 'dkl' == FLAGS.model:
-                                valid_loss += -mll(output, valid_y[:, 0])
+                                # Get predictive output
+                                output = model(**model_input)
+                                valid_loss += -loss_fn(output, labels[:, 0])
                                 pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                                pred_label = pred_prob.ge(0.5).float()
-                            else:
-                                if num_classes == 2:
-                                    valid_loss += mll(output, valid_y)
-                                    pred_prob = torch.sigmoid(output)
-                                    pred_label = pred_prob.ge(0.5).float()
-                                else:
-                                    valid_loss += mll(output, valid_y.long())
-                                    pred_label = torch.argmax(output, -1)
+                            elif 'dkl_llama2_7b' == FLAGS.model:
+                    
+                                if FLAGS.use_fromage:
+                                    # Embedding each drug / disease feature separately
+                                    fromage_features = fromage_adapter(
+                                        model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
+                                    ).reshape([FLAGS.batch_size, 2, data_dim])
+                                    model_input['gnn_embeddings'] = fromage_features
 
-                            valid_auroc += roc_auc_score(
-                                valid_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
-                            valid_auprc += average_precision_score(
-                                valid_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
-                            valid_correct += pred_label.eq(valid_y.view_as(pred_label)).cpu().sum()
+                                # Apply LLM
+                                llm_output = llm(**model_input)
+                                # Apply GP
+                                output = model(llm_output)
+                                valid_loss += -loss_fn(output, labels[:, 0])
+
+                                # Probability of predicting class 1
+                                pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                            else:
+                                # Get predictive output
+                                output = model(**model_input)
+                                valid_loss += loss_fn(output, labels)
+                                pred_prob = torch.sigmoid(output)
+
+                            pred_label = pred_prob.ge(0.5).float()
+                            valid_predictions.append(
+                                pred_prob.cpu().numpy())
+                            try:
+                                valid_auroc += roc_auc_score(
+                                    labels.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                                valid_auprc += average_precision_score(
+                                    labels.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                            except:
+                                pass
+
+                            valid_correct += pred_label.eq(labels.view_as(pred_label)).cpu().sum()
                             n_batches += 1
 
                     # Track Validation loss
@@ -243,37 +326,44 @@ def main(argv):
                     valid_loss = (valid_loss  / float(n_batches)).item()
                     valid_auroc = (valid_auroc  / float(n_batches))
                     valid_auprc = (valid_auprc  / float(n_batches))
+                    valid_predictions = np.concatenate(valid_predictions, axis=0)
 
                     print('Epoch/Iter: {}/{} - Valid Loss: {:.3f} - Acc: {}/{} ({:.3f}%) - AUROC: {:.3f} - AUPRC: {:.3f}'.format(
                         i + 1, j + 1, valid_loss, valid_correct.item(), len(valid_loader.dataset), valid_acc, valid_auroc, valid_auprc)
                     )
 
-                    if 'valid_plateau' == FLAGS.scheduler:
+                    if 'valid_plateau' == FLAGS.scheduler_type:
                         scheduler.step(loss)
-
-                    # Consider saving the best model
 
                     log_dict = {'valid_loss': valid_loss, 'valid_acc': valid_acc,
                                 'valid_auroc': valid_auroc, 'valid_auprc': valid_auprc}
-                    best_model_metrics = maybe_save(best_model_metrics, log_dict,
-                                                    ckpt_path, model, optimizer, likelihood)
+
+                    # Consider saving the best model
+                    best_model_metrics = maybe_save(best_model_metrics, log_dict, ckpt_path,
+                        model, optimizer, llm_state_dict, likelihood)
                     if FLAGS.wandb_track:
                         wandb.log(log_dict)
 
                 j += 1
-
-        if 'multi_step_lr' == FLAGS.scheduler:
-            scheduler.step()
+                if j >= FLAGS.n_max_steps and FLAGS.n_max_steps != -1:
+                    break
+                step += 1
 
 
     print(80 * '=')
     print('Loading best checkpoint for final evaluation')
     print(80 * '=')
+
     ckpt = torch.load(os.path.join(ckpt_path, 'best_auroc_auprc_model.pt'), map_location=device)
     model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
-    model.eval()
+    if llm_state_dict is not None:
+        # Needs special handling since we only saved PEFT parameters
+        llm.load_state_dict(
+            construct_llm_state_dict(llm, ckpt['likelihood_state_dict']))
+        llm.eval()
     if likelihood is not None:
         likelihood.load_state_dict(ckpt['likelihood_state_dict'])
         likelihood.eval()
@@ -283,32 +373,50 @@ def main(argv):
     test_correct = 0
     test_loss = 0.0
     n_batches = 0
+    test_predictions = [] 
+    test_labels = [] 
+    # This gives us 16 samples from the predictive distribution (for a GP)
     with torch.no_grad(), gpytorch.settings.num_likelihood_samples(16):
-        for test_x, test_y in test_loader:
-            if torch.cuda.is_available():
-                test_x, test_y = test_x.cuda(), test_y.cuda()
-                # Make compatible with MLP
-                test_x = test_x.view(test_x.size(0), -1)
-
-            # This gives us 16 samples from the predictive distribution (for a GP)
-            output = model(test_x)
+        for test_batch in test_loader:
+            model_input, labels = _assemble_batch(test_batch)
 
             if 'dkl' == FLAGS.model:
-                test_loss += -mll(output, test_y[:, 0])
+                # Get predictive output
+                output = model(**model_input)
+                test_loss += -loss_fn(output, labels[:, 0])
                 pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                pred_label = pred_prob.ge(0.5).float()
-            else:
-                if num_classes == 2:
-                    test_loss += mll(output, test_y)
-                    pred_prob = torch.sigmoid(output)
-                    pred_label = pred_prob.ge(0.5).float()
-                else:
-                    test_loss += mll(output, test_y.long())
-                    pred_label = torch.argmax(output, -1)
+            elif 'dkl_llama2_7b' == FLAGS.model:
+    
+                if FLAGS.use_fromage:
+                    # Embedding each drug / disease feature separately
+                    fromage_features = fromage_adapter(
+                        model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
+                    ).reshape([FLAGS.batch_size, 2, data_dim])
+                    model_input['gnn_embeddings'] = fromage_features
 
-            test_auroc += roc_auc_score(test_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
-            test_auprc += average_precision_score(test_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
-            correct_predictions = pred_label.eq(test_y.view_as(pred_label)).cpu().numpy()
+                # Apply LLM
+                llm_output = llm(**model_input)
+                # Apply GP
+                output = model(llm_output)
+                test_loss += -loss_fn(output, labels[:, 0])
+
+                # Probability of predicting class 1
+                pred_prob = likelihood(output).probs.mean(0)[:, 1]
+            else:
+                # Get predictive output
+                output = model(**model_input)
+                test_loss += loss_fn(output, labels)
+                pred_prob = torch.sigmoid(output)
+
+            pred_label = pred_prob.ge(0.5).float()
+            test_predictions.append(pred_prob.cpu().numpy())
+            test_labels.append(pred_label.cpu().numpy())
+            try:
+                test_auroc += roc_auc_score(labels.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+                test_auprc += average_precision_score(labels.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+            except:
+                pass
+            correct_predictions = pred_label.eq(labels.view_as(pred_label)).cpu().numpy()
             test_correct += correct_predictions.sum()
             n_batches += 1
 
@@ -317,6 +425,8 @@ def main(argv):
     test_loss = (test_loss  / float(n_batches)).item()
     test_auroc = (test_auroc  / float(n_batches))
     test_auprc = (test_auprc  / float(n_batches))
+    test_predictions = np.concatenate(test_predictions, axis=0)
+    test_labels = np.concatenate(test_labels, axis=0)
 
     print('{}. test loss: {:.3f} - acc: {}/{} ({:.3f}%) - auroc: {:.3f} - auprc: {:.3f}'.format(
         FLAGS.dataset, test_loss, test_correct.item(), len(test_loader.dataset), test_acc, test_auroc, test_auprc)
@@ -326,7 +436,7 @@ def main(argv):
 
     if FLAGS.wandb_track:
         wandb.log(log_dict)
-        fpr, tpr, _ = roc_curve(test_y.detach().cpu().numpy(), pred_prob.detach().cpu().numpy())
+        fpr, tpr, _ = roc_curve(test_labels, test_predictions)
         data = [[x, y] for (x, y) in zip(fpr, tpr)]
         table = wandb.Table(data=data, columns=["fpr", "tpr"])
         wandb.log({
@@ -336,6 +446,58 @@ def main(argv):
 
         # Save all checkpoints to wandb
         wandb.save(ckpt_path + '/*')
+
+        np.savez_compressed(
+            os.path.join(ckpt_path, 'predictions'), 
+            valid_predictions=valid_predictions,
+            test_predictions=test_predictions,
+        )
+        wandb.save(os.path.join(ckpt_path, 'predictions.npz'))
+
+        if FLAGS.full_matrix_eval:
+            matrix_loader, num_matrix_points = load_txgnn_dataset_matrix(
+                FLAGS.dataset, dataset_type, FLAGS.model, FLAGS.batch_size, device,
+            )
+            print('Evaluating on matrix set')
+            matrix_predictions = [] 
+            # This gives us 16 samples from the predictive distribution (for a GP)
+            with torch.no_grad(), gpytorch.settings.num_likelihood_samples(16):
+                for batch in matrix_loader:
+                    model_input = _assemble_batch(batch, return_labels=False)
+
+                    if 'dkl' == FLAGS.model:
+                        # Get predictive output
+                        output = model(**model_input)
+                        pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                    elif 'dkl_llama2_7b' == FLAGS.model:
+            
+                        if FLAGS.use_fromage:
+                            # Embedding each drug / disease feature separately
+                            fromage_features = fromage_adapter(
+                                model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
+                            ).reshape([FLAGS.batch_size, 2, final_dim])
+                            model_input['gnn_embeddings'] = fromage_features
+
+                        # Apply LLM
+                        llm_output = llm(**model_input)
+                        # Apply GP
+                        output = model(llm_output)
+
+                        # Probability of predicting class 1
+                        pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                    else:
+                        # Get predictive output
+                        output = model(**model_input)
+                        pred_prob = torch.sigmoid(output)
+
+                    matrix_predictions.append(pred_prob.cpu().numpy())
+
+                np.savez_compressed(
+                    os.path.join(ckpt_path, 'matrix_predictions'), 
+                    matrix_predictions=np.concatenate(matrix_predictions, axis=0),
+                )
+                wandb.save(os.path.join(ckpt_path, 'matrix_predictions.npz'))
+
 
 if __name__ == '__main__':
   app.run(main)

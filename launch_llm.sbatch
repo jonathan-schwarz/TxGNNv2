@@ -13,15 +13,4 @@ module load ncf/1.0.0-fasrc01
 module load miniconda3/py39_4.11.0-linux_x64-ncf
 
 # Run jobs
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --model='dkl_llama2_7b' \
-                                                                                       --use_fromage=True \
-                                                                                       --n_layers=1 \
-                                                                                       --finetune_type='lora' \
-                                                                                       --dataset='txgnn_did' \
-                                                                                       --n_epochs=30 \
-                                                                                       --batch_size=24 \
-                                                                                       --learning_rate=0.0001 \
-                                                                                       --scheduler_type='cosine_decay_with_warmup' \
-                                                                                       --valid_every=250 \
-                                                                                       --weight_decay=0.01 \
-                                                                                       --wandb_track=True
+/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl_llama2_7b/txgnn_did_default.cfg

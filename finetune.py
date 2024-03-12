@@ -229,7 +229,7 @@ def main(argv):
                         model_input['gnn_embeddings'] = fromage_features
 
                     # Apply LLM
-                    llm_output = llm(**model_input)#.to(torch.float32)
+                    llm_output = llm(**model_input).to(torch.float32)
                     if 'mlp' in FLAGS.model:
                         # Apply Linear layer
                         output = model(llm_output)
@@ -309,7 +309,7 @@ def main(argv):
                                     model_input['gnn_embeddings'] = fromage_features
 
                                 # Apply LLM
-                                llm_output = llm(**model_input)#.to(torch.float32)
+                                llm_output = llm(**model_input).to(torch.float32)
                                 if 'mlp' in FLAGS.model:
                                     # Apply Linear output
                                     output = model(llm_output)
@@ -419,7 +419,7 @@ def main(argv):
                     model_input['gnn_embeddings'] = fromage_features
 
                 # Apply LLM
-                llm_output = llm(**model_input)#.to(torch.float32)
+                llm_output = llm(**model_input).to(torch.float32)
                 if 'mlp' in FLAGS.model:
                     # Apply Linear output
                     output = model(llm_output)
@@ -512,7 +512,7 @@ def main(argv):
                             model_input['gnn_embeddings'] = fromage_features
 
                         # Apply LLM
-                        llm_output = llm(**model_input)#.to(torch.float32)
+                        llm_output = llm(**model_input).to(torch.float32)
                         if 'mlp' in FLAGS.model:
                             # Apply Linear output
                             output = model(llm_output)

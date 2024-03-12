@@ -29,25 +29,25 @@ from finetune_models.llm_models import *
 from finetune_models.models import *
 from data_utils import load_txgnn_dataset_text, load_txgnn_dataset_text_matrix
 
-os.environ["WANDB_PROJECT"] = "TxGNNv2"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ['WANDB_PROJECT'] = 'TxGNNv2'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 
 FLAGS = flags.FLAGS
 
 # Training settings
-flags.DEFINE_integer('n_epochs', 1, 'Number of epochs.', lower_bound=1)
+flags.DEFINE_integer('n_epochs', 30, 'Number of epochs.', lower_bound=1)
 flags.DEFINE_integer('n_max_steps', -1, 'Maximum number of training steps.', lower_bound=-1)
-flags.DEFINE_integer('batch_size', 2, 'Finetuning Batch size.', lower_bound=1)
-flags.DEFINE_integer('eval_batch_size', 32, 'Eval Batch size.', lower_bound=1)
+flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
+flags.DEFINE_integer('eval_batch_size', 24, 'Eval Batch size.', lower_bound=1)
 
 # Model
-flags.DEFINE_enum('best_model_metric', 'loss', ['loss', 'auroc_auprc'], 'What metric to use for early stopping.')
-flags.DEFINE_enum('model', 'dkl_llama2_7b', ['dkl_llama2_7b'], 'Model.')
-flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora'], 'Finetunting type.')
+flags.DEFINE_enum('best_model_metric', 'auroc_auprc', ['loss', 'auroc_auprc'], 'What metric to use for early stopping.')
+flags.DEFINE_enum('model', 'llama2_7b', ['mixtral', 'llama2_7b'], 'Model.')
+flags.DEFINE_enum('finetune_type', 'lora', ['full', 'lora'], 'Finetunting type.')
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
 flags.DEFINE_float('learning_rate', 2e-5, 'LR')
-flags.DEFINE_float('weight_decay', 1e-4, 'Weight decay for feature extractor')
+flags.DEFINE_float('weight_decay', 1e-2, 'Weight decay for feature extractor')
 
 # Misc
 flags.DEFINE_boolean('wandb_track', False, 'Use WandB')
@@ -72,10 +72,11 @@ def main(argv):
 
     tokenizer = get_tokenizer(FLAGS.model)
     tokenized_dataset, data_collator, task_type = load_txgnn_dataset_text(
-        FLAGS.dataset, FLAGS.seed, tokenizer)
+        FLAGS.dataset, tokenizer)
 
-    model, use_bf16 = get_llm_model(FLAGS.model, task_type, tokenizer)
-    model, optim = get_peft(model, task_type, FLAGS.finetune_type, FLAGS.lora_apply_everywhere)
+    model, use_bf16 = get_llm(FLAGS.model, task_type, tokenizer)
+    model, optim = get_peft(model, task_type, FLAGS.finetune_type, FLAGS.lora_apply_everywhere,
+                            use_final_layer=True)
 
     # Set training parameters
     training_args = TrainingArguments(
@@ -105,6 +106,7 @@ def main(argv):
 	bf16=use_bf16,
         gradient_checkpointing=False,
 	gradient_accumulation_steps=1,
+        group_by_length=False,
 	optim=optim,
         report_to="wandb" if FLAGS.wandb_track else "none",
         run_name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model),

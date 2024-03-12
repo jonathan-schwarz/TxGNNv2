@@ -82,6 +82,8 @@ def get_tokenizer(model_type):
 
 
 def get_llm(model_type, task_type, tokenizer, use_4bit=True):
+    del task_type  # Currently unused
+
     # Load the entire model on the GPU 0
     # TODO(schwarzjn): Fix for multi-GPU jobs
     device_map = {'': 0}
@@ -89,8 +91,15 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
     # Check GPU compatibility with bfloat16
     use_bf16 = False
 
-    # Check if we can use bfloat16
     compute_dtype = getattr(torch, 'float16')
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=use_4bit,
+        bnb_4bit_quant_type='nf4',
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=False,
+    )
+
+    # Check if we can use bfloat16
     if compute_dtype == torch.float16 and use_4bit:
         major, _ = torch.cuda.get_device_capability()
         if major >= 8:
@@ -98,13 +107,6 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
             print('Your GPU supports bfloat16: accelerating training with use_bf16=True')
             print('=' * 80)
             use_bf16 = True
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=use_4bit,
-        bnb_4bit_quant_type='nf4',
-        bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=False,
-    )
 
     if 'distilbert' == model_type:
         # No quantization necessary for DistilBert (small model)
@@ -178,8 +180,8 @@ def get_peft(model, task_type, finetune_type, lora_apply_everywhere, use_final_l
             'r': 64,
             'bias': 'none',
         }
-        if use_final_layer:
-            kwargs['modules_to_save'] = 'score'
+        # if use_final_layer:
+        #    kwargs['modules_to_save'] = 'score'
         if not lora_apply_everywhere:
             kwargs['target_modules'] = ['q_proj', 'k_proj', 'v_proj']  # 'out_proj', 'fc_in', 'fc_out', 'wte']
 

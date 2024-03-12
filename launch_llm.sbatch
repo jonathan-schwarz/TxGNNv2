@@ -13,4 +13,12 @@ module load ncf/1.0.0-fasrc01
 module load miniconda3/py39_4.11.0-linux_x64-ncf
 
 # Run jobs
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl_llama2_7b/txgnn_did_default.cfg
+
+# LLM + Linear head
+# Baseline (HuggingFace)
+# /n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune_llm.py
+# New
+/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp_llama2_7b/txgnn_did_linear_no_fromage.cfg
+
+# DKL + LLM
+# /n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl_llama2_7b/txgnn_did_default.cfg

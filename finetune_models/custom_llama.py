@@ -11,10 +11,9 @@ from transformers import modeling_outputs
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
 from typing import List, Optional, Tuple, Union
-from .models import DKLModel
 
 
-class LlamaForDKLSequenceClassification(LlamaPreTrainedModel):
+class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels

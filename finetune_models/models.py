@@ -132,7 +132,7 @@ def get_model(model_type, data_dim, num_classes, hidden_dim, n_layers, final_dim
                 num_features=model.num_dim, num_classes=num_classes).to(device)
     elif 'distmult' == model_type:
         model = DistMultModel(data_dim//2, num_classes).to(device)
-    elif 'mlp' == model_type:
+    elif 'mlp' in model_type:
         model = FeatureExtractor(
             data_dim=data_dim,
             hidden_dim=hidden_dim,

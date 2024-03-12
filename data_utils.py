@@ -66,7 +66,6 @@ def load_txgnn_dataset_text(dataset, tokenizer):
     )
 
     def _preprocess_function(examples):
-        # return tokenizer(examples["text"], truncation=True, padding=True)
         return tokenizer(examples["text"], truncation=True, max_length=MAX_LENGTH, pad_to_max_length=True)
 
     tokenized_dataset = full_dataset.map(_preprocess_function, batched=True)

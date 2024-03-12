@@ -8,6 +8,7 @@ import gpytorch
 import math
 import numpy as np
 import os
+import random
 import torch
 import wandb
 
@@ -29,8 +30,9 @@ flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
 
 # Model
 flags.DEFINE_boolean('use_feature_extractor', True, 'DKL')
-flags.DEFINE_enum('model', 'dkl', ['dkl', 'dkl_llama2_7b', 'mlp', 'distmult'], 'Model.')
+flags.DEFINE_enum('model', 'dkl', ['distmult', 'mlp', 'dkl', 'mlp_llama2_7b', 'dkl_llama2_7b'], 'Model to use.')
 flags.DEFINE_float('learning_rate', 0.01, 'LR')
+flags.DEFINE_float('dkl_learning_rate_multiplier', 0.01, 'LR factor for GP hyperparameters')
 flags.DEFINE_float('weight_decay', 1e-4, 'Weight decay for feature extractor')
 flags.DEFINE_enum('scheduler_type', 'cosine_decay_with_warmup', ['cosine_decay', 'cosine_decay_with_warmup', 'multi_step_lr', 'valid_plateau'], 'LR Scheduler.')
 flags.DEFINE_integer('grid_size', 64, 'DKL Grid size', lower_bound=2)
@@ -95,10 +97,11 @@ def save_model(path, metric_name, model, optimizer, llm_state_dict=None, likelih
 
 
 def main(argv):
-    # Fix random seed
+    # Fix random seed (TODO(schwarzjn): Also for DataLoader)
     torch.manual_seed(FLAGS.seed)
     torch.cuda.manual_seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
+    random.seed(FLAGS.seed)
 
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
@@ -158,25 +161,28 @@ def main(argv):
 
      # Optimizer & LR scheduler
     llm_state_dict = None
-    if 'dkl' in FLAGS.model:
-        params = [
-            {'params': model.gp_layer.hyperparameters(), 'lr': FLAGS.learning_rate * 0.01},
-            {'params': model.gp_layer.variational_parameters()},
-            {'params': likelihood.parameters()},
-        ]   
-        if 'llama2_7b' in FLAGS.model:
-            llm_state_dict = get_trainable_parameters(llm)
+    params = []
+    if 'llama2_7b' in FLAGS.model:
+        llm_state_dict = get_trainable_parameters(llm)
 
-            # Needs special handling so we only save PEFT parameters
-            params.append({'params': [v for k, v in llm_state_dict.items()], 'weight_decay': FLAGS.weight_decay})
-            if FLAGS.use_fromage:
-                params.append({'params': fromage_adapter.parameters()})
+        # Needs special handling so we only save PEFT parameters
+        params.append({'params': [v for k, v in llm_state_dict.items()], 'weight_decay': FLAGS.weight_decay})
+        if FLAGS.use_fromage:
+            params.append({'params': fromage_adapter.parameters()})
+
+    if 'dkl' in FLAGS.model:
+        params.append({'params': model.gp_layer.hyperparameters(),
+                       'lr': FLAGS.learning_rate * FLAGS.dkl_learning_rate_multiplier})
+        params.append({'params': model.gp_layer.variational_parameters()})
+        params.append({'params': likelihood.parameters()})
+
         if FLAGS.use_feature_extractor:
             params.append({'params': model.feature_extractor.parameters(), 'weight_decay': FLAGS.weight_decay})
     else:
         llm_state_dict = None
-        params = [v for v in model.parameters()]
+        params.append({'params': model.parameters()})
 
+    # TODO(schwarzjn): Enabled paged optimizer
     optimizer = torch.optim.Adam(params, lr=FLAGS.learning_rate)
     scheduler = load_scheduler(FLAGS.scheduler_type, optimizer, FLAGS.n_epochs, 
                                num_train_points // FLAGS.batch_size)
@@ -212,7 +218,7 @@ def main(argv):
 
                     # Probability of predicting class 1
                     pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                elif 'dkl_llama2_7b' == FLAGS.model:
+                elif 'llama2_7b' in FLAGS.model:
         
                     if FLAGS.use_fromage:
                         # Embedding each drug / disease feature separately
@@ -223,13 +229,21 @@ def main(argv):
                         model_input['gnn_embeddings'] = fromage_features
 
                     # Apply LLM
-                    llm_output = llm(**model_input)
-                    # Apply GP
-                    output = model(llm_output)
-                    loss = -loss_fn(output, labels[:, 0])
+                    llm_output = llm(**model_input)#.to(torch.float32)
+                    if 'mlp' in FLAGS.model:
+                        # Apply Linear layer
+                        output = model(llm_output)
+                        loss = loss_fn(output, labels)
 
-                    # Probability of predicting class 1
-                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                        # Probability of predicting class 1
+                        pred_prob = torch.sigmoid(output)
+                    else:
+                        # Apply GP
+                        output = model(llm_output)
+                        loss = -loss_fn(output, labels[:, 0])
+
+                        # Probability of predicting class 1
+                        pred_prob = likelihood(output).probs.mean(0)[:, 1]
                 else:
                     # Get predictive output
                     output = model(**model_input)
@@ -284,23 +298,32 @@ def main(argv):
                                 output = model(**model_input)
                                 valid_loss += -loss_fn(output, labels[:, 0])
                                 pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                            elif 'dkl_llama2_7b' == FLAGS.model:
+                            elif 'llama2_7b' in FLAGS.model:
                     
                                 if FLAGS.use_fromage:
                                     # Embedding each drug / disease feature separately
+                                    # TODO(schwarzjn): Should we process drug/disease embedding separately?
                                     fromage_features = fromage_adapter(
                                         model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
                                     ).reshape([FLAGS.batch_size, 2, data_dim])
                                     model_input['gnn_embeddings'] = fromage_features
 
                                 # Apply LLM
-                                llm_output = llm(**model_input)
-                                # Apply GP
-                                output = model(llm_output)
-                                valid_loss += -loss_fn(output, labels[:, 0])
+                                llm_output = llm(**model_input)#.to(torch.float32)
+                                if 'mlp' in FLAGS.model:
+                                    # Apply Linear output
+                                    output = model(llm_output)
+                                    valid_loss += loss_fn(output, labels)
 
-                                # Probability of predicting class 1
-                                pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                                    # Probability of predicting class 1
+                                    pred_prob = torch.sigmoid(output)
+                                else:
+                                    # Apply GP
+                                    output = model(llm_output)
+                                    valid_loss += -loss_fn(output, labels[:, 0])
+
+                                    # Probability of predicting class 1
+                                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
                             else:
                                 # Get predictive output
                                 output = model(**model_input)
@@ -385,23 +408,32 @@ def main(argv):
                 output = model(**model_input)
                 test_loss += -loss_fn(output, labels[:, 0])
                 pred_prob = likelihood(output).probs.mean(0)[:, 1]
-            elif 'dkl_llama2_7b' == FLAGS.model:
+            elif 'llama2_7b' in FLAGS.model:
     
                 if FLAGS.use_fromage:
                     # Embedding each drug / disease feature separately
+                    # TODO(schwarzjn): Should we process drug/disease embedding separately?
                     fromage_features = fromage_adapter(
                         model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
                     ).reshape([FLAGS.batch_size, 2, data_dim])
                     model_input['gnn_embeddings'] = fromage_features
 
                 # Apply LLM
-                llm_output = llm(**model_input)
-                # Apply GP
-                output = model(llm_output)
-                test_loss += -loss_fn(output, labels[:, 0])
+                llm_output = llm(**model_input)#.to(torch.float32)
+                if 'mlp' in FLAGS.model:
+                    # Apply Linear output
+                    output = model(llm_output)
+                    test_loss += loss_fn(output, labels)
 
-                # Probability of predicting class 1
-                pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                    # Probability of predicting class 1
+                    pred_prob = torch.sigmoid(output)
+                else:
+                    # Apply GP
+                    output = model(llm_output)
+                    test_loss += -loss_fn(output, labels[:, 0])
+
+                    # Probability of predicting class 1
+                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
             else:
                 # Get predictive output
                 output = model(**model_input)
@@ -469,22 +501,30 @@ def main(argv):
                         # Get predictive output
                         output = model(**model_input)
                         pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                    elif 'dkl_llama2_7b' == FLAGS.model:
+                    elif 'llama2_7b' in FLAGS.model:
             
                         if FLAGS.use_fromage:
                             # Embedding each drug / disease feature separately
+                            # TODO(schwarzjn): Should we process drug/disease embedding separately?
                             fromage_features = fromage_adapter(
                                 model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
-                            ).reshape([FLAGS.batch_size, 2, final_dim])
+                            ).reshape([FLAGS.batch_size, 2, data_dim])
                             model_input['gnn_embeddings'] = fromage_features
 
                         # Apply LLM
-                        llm_output = llm(**model_input)
-                        # Apply GP
-                        output = model(llm_output)
+                        llm_output = llm(**model_input)#.to(torch.float32)
+                        if 'mlp' in FLAGS.model:
+                            # Apply Linear output
+                            output = model(llm_output)
 
-                        # Probability of predicting class 1
-                        pred_prob = likelihood(output).probs.mean(0)[:, 1]
+                            # Probability of predicting class 1
+                            pred_prob = torch.sigmoid(output)
+                        else:
+                            # Apply GP
+                            output = model(llm_output)
+
+                            # Probability of predicting class 1
+                            pred_prob = likelihood(output).probs.mean(0)[:, 1]
                     else:
                         # Get predictive output
                         output = model(**model_input)

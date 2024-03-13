@@ -112,7 +112,6 @@ def main(argv):
 
     if FLAGS.wandb_track:
         config = {v: getattr(FLAGS, v) for v in dir(FLAGS)}
-        import pdb; pdb.set_trace()
         wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model),
                    config=config, config_exclude_keys=_CONFIG_EXCLUDE_KEYS)
 

@@ -16,6 +16,7 @@ from data_utils import *
 from finetune_models.models import *
 from finetune_models.llm_models import *
 from train_utils import *
+from train_utils import _CONFIG_EXCLUDE_KEYS
 
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
@@ -50,8 +51,6 @@ flags.DEFINE_boolean('wandb_track', False, 'Whether to use wandb.')
 
 
 # Misc
-flags.DEFINE_string('checkpoint', './checkpoints/finetune/model_ckpt', 'Checkpoint location.')
-flags.DEFINE_string('data_path', './data', 'Data location.')
 # Valid choices are ['did', 'dod', 'dcd', 'drid', 'drod', 'drcd']
 flags.DEFINE_enum('dataset', 'txgnn_dod', ['txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
 flags.DEFINE_boolean('full_matrix_eval', True, 'Evaluate on full matrix')
@@ -112,7 +111,10 @@ def main(argv):
         FLAGS.dataset, FLAGS.model, str(datetime.datetime.now()))
 
     if FLAGS.wandb_track:
-        wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model))
+        config = {v: getattr(FLAGS, v) for v in dir(FLAGS)}
+        import pdb; pdb.set_trace()
+        wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model),
+                   config=config, config_exclude_keys=_CONFIG_EXCLUDE_KEYS)
 
     # Load data from pretrained GNN
     dataset_type = 'embedding_text' if 'llama' in FLAGS.model else 'embedding'

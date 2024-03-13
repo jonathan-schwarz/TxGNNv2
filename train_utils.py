@@ -5,6 +5,12 @@ import torch
 from collections import OrderedDict
 
 
+# Exlude these standard flags from wandb config
+_CONFIG_EXCLUDE_KEYS = ['?', 'alsologtostderr', 'help', 'helpfull', 'helpshort', 'helpxml',
+    'log_dir', 'logger_levels', 'logtostderr', 'only_check_args', 'pdb', 'pdb_post_mortem',
+    'profile_file', 'run_with_pdb', 'run_with_profiling', 'showprefixforinfo', 'stderrthreshold',
+    'use_cprofile_for_profiling', 'v', 'verbosity']
+
 def load_scheduler(scheduler_type, optimizer, n_epochs, steps_per_epoch):
 
     total_steps = n_epochs * steps_per_epoch

@@ -3,10 +3,11 @@
 import torch
 
 from collections import OrderedDict
+from torch.nn.utils.clip_grad import *
 
 
 # Exlude these standard flags from wandb config
-_CONFIG_EXCLUDE_KEYS = ['?', 'alsologtostderr', 'help', 'helpfull', 'helpshort', 'helpxml',
+CONFIG_EXCLUDE_KEYS = ['?', 'alsologtostderr', 'help', 'helpfull', 'helpshort', 'helpxml',
     'log_dir', 'logger_levels', 'logtostderr', 'only_check_args', 'pdb', 'pdb_post_mortem',
     'profile_file', 'run_with_pdb', 'run_with_profiling', 'showprefixforinfo', 'stderrthreshold',
     'use_cprofile_for_profiling', 'v', 'verbosity']
@@ -38,6 +39,9 @@ def load_scheduler(scheduler_type, optimizer, n_epochs, steps_per_epoch):
             optimizer,
             milestones=[0.25 * total_steps, 0.5 * total_steps, 0.75 * total_steps],
             gamma=0.1)
+    else:
+        scheduler = torch.optim.lr_scheduler.ConstantLR(
+        optimizer, 1.0, total_steps)
 
     return scheduler
 
@@ -72,3 +76,22 @@ def construct_llm_state_dict(llm, partial_state_dict):
                 full_state_dict[param_name] = param
 
     return full_state_dict
+
+def clip_grad_norm(model, llm, fromage_adapter, likelihood,
+                    max_norm=10.0, norm_type=2.0):
+    log_dict = {}
+
+    log_dict['model_norm'] = clip_grad_norm_(
+        model.parameters(), max_norm=max_norm, norm_type=norm_type)
+
+    if llm is not None:
+        log_dict['llm_norm'] = clip_grad_norm_(
+        llm.parameters(), max_norm=max_norm, norm_type=norm_type)
+    if fromage_adapter is not None:
+        log_dict['fromage_norm'] = clip_grad_norm_(
+            fromage_adapter.parameters(), max_norm=max_norm, norm_type=norm_type)
+    if likelihood is not None:
+        log_dict['likelihood_norm'] = clip_grad_norm_(
+            likelihood.parameters(), max_norm=max_norm, norm_type=norm_type)
+
+    return log_dict

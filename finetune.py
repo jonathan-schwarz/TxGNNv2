@@ -16,7 +16,6 @@ from data_utils import *
 from finetune_models.models import *
 from finetune_models.llm_models import *
 from train_utils import *
-from train_utils import _CONFIG_EXCLUDE_KEYS
 
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
@@ -33,9 +32,10 @@ flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
 flags.DEFINE_boolean('use_feature_extractor', True, 'DKL')
 flags.DEFINE_enum('model', 'dkl', ['distmult', 'mlp', 'dkl', 'mlp_llama2_7b', 'dkl_llama2_7b'], 'Model to use.')
 flags.DEFINE_float('learning_rate', 0.01, 'LR')
+flags.DEFINE_float('max_grad_norm', 10.0, 'Used for optional gradient clipping')
 flags.DEFINE_float('dkl_learning_rate_multiplier', 0.01, 'LR factor for GP hyperparameters')
 flags.DEFINE_float('weight_decay', 1e-4, 'Weight decay for feature extractor')
-flags.DEFINE_enum('scheduler_type', 'cosine_decay_with_warmup', ['cosine_decay', 'cosine_decay_with_warmup', 'multi_step_lr', 'valid_plateau'], 'LR Scheduler.')
+flags.DEFINE_enum('scheduler_type', 'cosine_decay_with_warmup', ['constant', 'cosine_decay', 'cosine_decay_with_warmup', 'multi_step_lr', 'valid_plateau'], 'LR Scheduler.')
 flags.DEFINE_integer('grid_size', 64, 'DKL Grid size', lower_bound=2)
 flags.DEFINE_integer('final_dim', 256, 'DKL Final Dim.', lower_bound=1)
 flags.DEFINE_integer('hidden_dim', 256, 'DKL Hidden Dim.', lower_bound=1)
@@ -43,7 +43,7 @@ flags.DEFINE_integer('n_layers', 3, 'DKL Hidden Layers.', lower_bound=1)
 # Only for LLMs
 flags.DEFINE_boolean('use_fromage', True, 'Whether to use GNN features in LLM predictive model.')
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
-flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora'], 'Finetunting type.')
+flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora', 'none'], 'LLM Finetunting type. Disabled when `none`')
 # Only for DKL
 flags.DEFINE_enum('strategy', 'grid_interpolation',
                   ['grid_interpolation', 'unwhitened'], 'Variational Strategy.')
@@ -113,7 +113,7 @@ def main(argv):
     if FLAGS.wandb_track:
         config = {v: getattr(FLAGS, v) for v in dir(FLAGS)}
         wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model),
-                   config=config, config_exclude_keys=_CONFIG_EXCLUDE_KEYS)
+                   config=config, config_exclude_keys=CONFIG_EXCLUDE_KEYS)
 
     # Load data from pretrained GNN
     dataset_type = 'embedding_text' if 'llama' in FLAGS.model else 'embedding'
@@ -128,6 +128,8 @@ def main(argv):
                                         device=device)
 
     # Build model
+    fromage_adapter = None
+    llm = None
     if 'llama' in FLAGS.model:
         # llama embedding dimension
         data_dim = 4096
@@ -143,8 +145,6 @@ def main(argv):
             gnn_data_dim = 1024
             fromage_adapter = get_fromage_adapter(
                 gnn_data_dim // 2, FLAGS.hidden_dim, FLAGS.n_layers, data_dim, llm.device)
-    else:
-        llm = None
 
 
     # Predictive model
@@ -167,7 +167,8 @@ def main(argv):
         llm_state_dict = get_trainable_parameters(llm)
 
         # Needs special handling so we only save PEFT parameters
-        params.append({'params': [v for k, v in llm_state_dict.items()], 'weight_decay': FLAGS.weight_decay})
+        if FLAGS.finetune_type != 'none':
+            params.append({'params': [v for k, v in llm_state_dict.items()], 'weight_decay': FLAGS.weight_decay})
         if FLAGS.use_fromage:
             params.append({'params': fromage_adapter.parameters()})
 
@@ -180,7 +181,6 @@ def main(argv):
         if FLAGS.use_feature_extractor:
             params.append({'params': model.feature_extractor.parameters(), 'weight_decay': FLAGS.weight_decay})
     else:
-        llm_state_dict = None
         params.append({'params': model.parameters()})
 
     # TODO(schwarzjn): Enabled paged optimizer
@@ -265,6 +265,8 @@ def main(argv):
 
                 # Train step
                 loss.backward()
+                # Log gradient norm
+                log_dict = clip_grad_norm(model, llm, fromage_adapter, likelihood, max_norm=FLAGS.max_grad_norm)
                 optimizer.step()
 
                 if 'valid_plateau' != FLAGS.scheduler_type:
@@ -278,9 +280,12 @@ def main(argv):
                     i + 1, j + 1, loss.item(), train_acc, train_auroc, train_auprc))
 
                 if FLAGS.wandb_track:
-                    wandb.log({
-                        'train_loss': loss, 'train_acc': train_acc, 'train_lr': optimizer.param_groups[0]['lr'],
-                        'train_auroc': train_auroc, 'train_auprc': train_auprc})
+                    log_dict['train_loss'] = loss
+                    log_dict['train_acc'] = train_acc
+                    log_dict['train_lr'] = optimizer.param_groups[0]['lr']
+                    log_dict['train_auroc'] = train_auroc
+                    log_dict['train_auprc'] = train_auprc
+                    wandb.log(log_dict)
 
                 if 0 == (j % FLAGS.valid_every):
                     valid_auprc = 0.0

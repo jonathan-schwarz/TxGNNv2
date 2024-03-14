@@ -180,6 +180,7 @@ def get_peft(model, task_type, finetune_type, lora_apply_everywhere, use_final_l
             'r': 64,
             'bias': 'none',
         }
+        # TODO(schwarzjn): Check
         # if use_final_layer:
         #    kwargs['modules_to_save'] = 'score'
         if not lora_apply_everywhere:
@@ -187,7 +188,7 @@ def get_peft(model, task_type, finetune_type, lora_apply_everywhere, use_final_l
 
         peft_config = LoraConfig(**kwargs)
         optim = 'paged_adamw_32bit'
-    elif 'full' in finetune_type:
+    else:
         peft_config = None
 
     if peft_config is not None:

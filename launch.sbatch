@@ -15,16 +15,16 @@ module load miniconda3/py39_4.11.0-linux_x64-ncf
 # Run jobs
 
 # DistMult
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/distmult/txgnn_did_default.cfg
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/distmult/txgnn_dod_default.cfg
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/distmult/txgnn_dcd_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/distmult/txgnn_did_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/distmult/txgnn_dod_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/distmult/txgnn_dcd_default.cfg
 
 # MLP
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp/txgnn_did_default.cfg
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp/txgnn_dod_default.cfg
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp/txgnn_dcd_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp/txgnn_did_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp/txgnn_dod_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp/txgnn_dcd_default.cfg
 
 # DKL
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl/txgnn_did_default.cfg
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl/txgnn_dod_default.cfg
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl/txgnn_dcd_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl/txgnn_did_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl/txgnn_dod_default.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl/txgnn_dcd_default.cfg

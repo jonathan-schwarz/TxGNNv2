@@ -18,7 +18,7 @@ module load miniconda3/py39_4.11.0-linux_x64-ncf
 # Baseline (HuggingFace)
 # /n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune_llm.py
 # New
-/n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp_llama2_7b/txgnn_did_linear_no_fromage.cfg
+/n/home06/jkondic/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/mlp_llama2_7b/txgnn_did_linear_no_fromage.cfg
 
 # DKL + LLM
 # /n/home06/jschwarz/.conda/envs/txgnnv2_env/bin/python3 finetune.py python3 finetune.py --flagfile=configs/dkl_llama2_7b/txgnn_did_default.cfg

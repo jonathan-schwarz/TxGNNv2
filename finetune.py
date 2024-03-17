@@ -160,7 +160,7 @@ def main(argv):
     if llm is not None:
         llm.train()
 
-     # Optimizer & LR scheduler
+    # Optimizer & LR scheduler
     llm_state_dict = None
     params = []
     if 'llama2_7b' in FLAGS.model:
@@ -169,19 +169,30 @@ def main(argv):
         # Needs special handling so we only save PEFT parameters
         if FLAGS.finetune_type != 'none':
             params.append({'params': [v for k, v in llm_state_dict.items()], 'weight_decay': FLAGS.weight_decay})
+            if FLAGS.wandb_track:
+                wandb.watch(llm, log_freq=25)
         if FLAGS.use_fromage:
             params.append({'params': fromage_adapter.parameters()})
+            if FLAGS.wandb_track:
+                wandb.watch(fromage_adapter, log_freq=25)
 
     if 'dkl' in FLAGS.model:
         params.append({'params': model.gp_layer.hyperparameters(),
                        'lr': FLAGS.learning_rate * FLAGS.dkl_learning_rate_multiplier})
         params.append({'params': model.gp_layer.variational_parameters()})
-        params.append({'params': likelihood.parameters()})
 
         if FLAGS.use_feature_extractor:
             params.append({'params': model.feature_extractor.parameters(), 'weight_decay': FLAGS.weight_decay})
+        if FLAGS.wandb_track:
+            wandb.watch(model, log_freq=25)
+
+        params.append({'params': likelihood.parameters()})
+        if FLAGS.wandb_track:
+            wandb.watch(likelihood, log_freq=25)
     else:
         params.append({'params': model.parameters()})
+        if FLAGS.wandb_track:
+            wandb.watch(model, log_freq=25)
 
     # TODO(schwarzjn): Enabled paged optimizer
     optimizer = torch.optim.Adam(params, lr=FLAGS.learning_rate)
@@ -231,6 +242,7 @@ def main(argv):
 
                     # Apply LLM
                     llm_output = llm(**model_input).to(torch.float32)
+
                     if 'mlp' in FLAGS.model:
                         # Apply Linear layer
                         output = model(llm_output)
@@ -265,6 +277,7 @@ def main(argv):
 
                 # Train step
                 loss.backward()
+
                 # Log gradient norm
                 log_dict = clip_grad_norm(model, llm, fromage_adapter, likelihood, max_norm=FLAGS.max_grad_norm)
                 optimizer.step()

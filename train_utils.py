@@ -77,6 +77,7 @@ def construct_llm_state_dict(llm, partial_state_dict):
 
     return full_state_dict
 
+
 def clip_grad_norm(model, llm, fromage_adapter, likelihood,
                     max_norm=10.0, norm_type=2.0):
     log_dict = {}
@@ -95,3 +96,53 @@ def clip_grad_norm(model, llm, fromage_adapter, likelihood,
             likelihood.parameters(), max_norm=max_norm, norm_type=norm_type)
 
     return log_dict
+
+
+def forward_pass(model_type, use_fromage, model, llm, fromage_adapter, likelihood, model_input, labels, return_loss=True):
+    if 'dkl' == model_type:
+        # Get predictive output
+        output = model(**model_input)
+        if return_loss:
+            loss = -loss_fn(output, labels[:, 0])
+        pred_prob = likelihood(output).probs.mean(0)[:, 1]
+    elif 'llama2_7b' in model_type:
+
+        if use_fromage:
+            # Embedding each drug / disease feature separately
+            # TODO(schwarzjn): Should we process drug/disease embedding separately?
+            fromage_features = fromage_adapter(
+                model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
+            ).reshape([FLAGS.batch_size, 2, data_dim])
+            model_input['gnn_embeddings'] = fromage_features
+
+        # Apply LLM
+        llm_output = llm(**model_input).to(torch.float32)
+        if 'mlp' in model_type:
+            # Apply Linear output
+            output = model(llm_output)
+            if return_loss:
+                loss = loss_fn(output, labels)
+
+            # Probability of predicting class 1
+            pred_prob = torch.sigmoid(output)
+        else:
+            # Apply GP
+            output = model(llm_output)
+            if return_loss:
+                loss = -loss_fn(output, labels[:, 0])
+
+            # Probability of predicting class 1
+            pred_prob = likelihood(output).probs.mean(0)[:, 1]
+    else:
+        # Get predictive output
+        output = model(**model_input)
+        if return_loss:
+            loss = loss_fn(output, labels)
+        pred_prob = torch.sigmoid(output)
+
+    pred_label = pred_prob.ge(0.5).float()
+
+    if return_loss:
+        return pred_prob, pred_label, loss
+    else:
+        return pred_prob, pred_label

@@ -23,9 +23,9 @@ from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 FLAGS = flags.FLAGS
 
 # Training settings
+flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
 flags.DEFINE_integer('n_epochs', 1, 'Number of epochs.', lower_bound=1)
 flags.DEFINE_integer('n_max_steps', -1, 'Maximum number of training steps.', lower_bound=-1)
-flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
 
 
 # Model
@@ -223,49 +223,11 @@ def main(argv):
 
                 model_input, labels = _assemble_batch(batch)
 
-                if 'dkl' == FLAGS.model:
-                    # Get predictive output
-                    output = model(**model_input)
-                    loss = -loss_fn(output, labels[:, 0])
+                pred_prob, pred_label, loss = forward_pass(
+                    FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                    model_input, labels, return_loss=True,
+                )
 
-                    # Probability of predicting class 1
-                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                elif 'llama2_7b' in FLAGS.model:
-        
-                    if FLAGS.use_fromage:
-                        # Embedding each drug / disease feature separately
-                        # TODO(schwarzjn): Should we process drug/disease embedding separately?
-                        fromage_features = fromage_adapter(
-                            model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
-                        ).reshape([FLAGS.batch_size, 2, data_dim])
-                        model_input['gnn_embeddings'] = fromage_features
-
-                    # Apply LLM
-                    llm_output = llm(**model_input).to(torch.float32)
-
-                    if 'mlp' in FLAGS.model:
-                        # Apply Linear layer
-                        output = model(llm_output)
-                        loss = loss_fn(output, labels)
-
-                        # Probability of predicting class 1
-                        pred_prob = torch.sigmoid(output)
-                    else:
-                        # Apply GP
-                        output = model(llm_output)
-                        loss = -loss_fn(output, labels[:, 0])
-
-                        # Probability of predicting class 1
-                        pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                else:
-                    # Get predictive output
-                    output = model(**model_input)
-                    loss = loss_fn(output, labels)
-
-                    # Probability of predicting class 1
-                    pred_prob = torch.sigmoid(output)
-
-                pred_label = pred_prob.ge(0.5).float()
                 try:
                     # TODO(schwarzjn): Fix error when we have only positive/only negative examples
                     train_auroc = roc_auc_score(
@@ -312,44 +274,12 @@ def main(argv):
                         for valid_batch in valid_loader:
                             model_input, labels = _assemble_batch(valid_batch)
 
-                            if 'dkl' == FLAGS.model:
-                                # Get predictive output
-                                output = model(**model_input)
-                                valid_loss += -loss_fn(output, labels[:, 0])
-                                pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                            elif 'llama2_7b' in FLAGS.model:
-                    
-                                if FLAGS.use_fromage:
-                                    # Embedding each drug / disease feature separately
-                                    # TODO(schwarzjn): Should we process drug/disease embedding separately?
-                                    fromage_features = fromage_adapter(
-                                        model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
-                                    ).reshape([FLAGS.batch_size, 2, data_dim])
-                                    model_input['gnn_embeddings'] = fromage_features
+                            pred_prob, pred_label, loss = forward_pass(
+                                FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                                model_input, labels, return_loss=True,
+                            )
+                            valid_loss += loss
 
-                                # Apply LLM
-                                llm_output = llm(**model_input).to(torch.float32)
-                                if 'mlp' in FLAGS.model:
-                                    # Apply Linear output
-                                    output = model(llm_output)
-                                    valid_loss += loss_fn(output, labels)
-
-                                    # Probability of predicting class 1
-                                    pred_prob = torch.sigmoid(output)
-                                else:
-                                    # Apply GP
-                                    output = model(llm_output)
-                                    valid_loss += -loss_fn(output, labels[:, 0])
-
-                                    # Probability of predicting class 1
-                                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                            else:
-                                # Get predictive output
-                                output = model(**model_input)
-                                valid_loss += loss_fn(output, labels)
-                                pred_prob = torch.sigmoid(output)
-
-                            pred_label = pred_prob.ge(0.5).float()
                             valid_predictions.append(
                                 pred_prob.cpu().numpy())
                             try:
@@ -404,7 +334,7 @@ def main(argv):
     if llm_state_dict is not None:
         # Needs special handling since we only saved PEFT parameters
         llm.load_state_dict(
-            construct_llm_state_dict(llm, ckpt['likelihood_state_dict']))
+            construct_llm_state_dict(llm, ckpt['llm_state_dict']))
         llm.eval()
     if likelihood is not None:
         likelihood.load_state_dict(ckpt['likelihood_state_dict'])
@@ -422,44 +352,12 @@ def main(argv):
         for test_batch in test_loader:
             model_input, labels = _assemble_batch(test_batch)
 
-            if 'dkl' == FLAGS.model:
-                # Get predictive output
-                output = model(**model_input)
-                test_loss += -loss_fn(output, labels[:, 0])
-                pred_prob = likelihood(output).probs.mean(0)[:, 1]
-            elif 'llama2_7b' in FLAGS.model:
-    
-                if FLAGS.use_fromage:
-                    # Embedding each drug / disease feature separately
-                    # TODO(schwarzjn): Should we process drug/disease embedding separately?
-                    fromage_features = fromage_adapter(
-                        model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
-                    ).reshape([FLAGS.batch_size, 2, data_dim])
-                    model_input['gnn_embeddings'] = fromage_features
+            pred_prob, pred_label, loss = forward_pass(
+                FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                model_input, labels, return_loss=True,
+            )
+            test_loss += loss
 
-                # Apply LLM
-                llm_output = llm(**model_input).to(torch.float32)
-                if 'mlp' in FLAGS.model:
-                    # Apply Linear output
-                    output = model(llm_output)
-                    test_loss += loss_fn(output, labels)
-
-                    # Probability of predicting class 1
-                    pred_prob = torch.sigmoid(output)
-                else:
-                    # Apply GP
-                    output = model(llm_output)
-                    test_loss += -loss_fn(output, labels[:, 0])
-
-                    # Probability of predicting class 1
-                    pred_prob = likelihood(output).probs.mean(0)[:, 1]
-            else:
-                # Get predictive output
-                output = model(**model_input)
-                test_loss += loss_fn(output, labels)
-                pred_prob = torch.sigmoid(output)
-
-            pred_label = pred_prob.ge(0.5).float()
             test_predictions.append(pred_prob.cpu().numpy())
             test_labels.append(pred_label.cpu().numpy())
             try:
@@ -516,38 +414,10 @@ def main(argv):
                 for batch in matrix_loader:
                     model_input = _assemble_batch(batch, return_labels=False)
 
-                    if 'dkl' == FLAGS.model:
-                        # Get predictive output
-                        output = model(**model_input)
-                        pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                    elif 'llama2_7b' in FLAGS.model:
-            
-                        if FLAGS.use_fromage:
-                            # Embedding each drug / disease feature separately
-                            # TODO(schwarzjn): Should we process drug/disease embedding separately?
-                            fromage_features = fromage_adapter(
-                                model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
-                            ).reshape([FLAGS.batch_size, 2, data_dim])
-                            model_input['gnn_embeddings'] = fromage_features
-
-                        # Apply LLM
-                        llm_output = llm(**model_input).to(torch.float32)
-                        if 'mlp' in FLAGS.model:
-                            # Apply Linear output
-                            output = model(llm_output)
-
-                            # Probability of predicting class 1
-                            pred_prob = torch.sigmoid(output)
-                        else:
-                            # Apply GP
-                            output = model(llm_output)
-
-                            # Probability of predicting class 1
-                            pred_prob = likelihood(output).probs.mean(0)[:, 1]
-                    else:
-                        # Get predictive output
-                        output = model(**model_input)
-                        pred_prob = torch.sigmoid(output)
+                    pred_prob, _ = forward_pass(
+                        FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                        model_input, labels, return_loss=False,
+                    )
 
                     matrix_predictions.append(pred_prob.cpu().numpy())
 

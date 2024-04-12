@@ -22,18 +22,20 @@ FILE_NAMES = {
 }
 
 MAX_LENGTH = 65
+NUM_DISEASES = 66  # In `txgnn_did` test set
+NUM_DRUGS = 7957
 
 
-def load_split(outfile, mode, merge_str):
+def load_split(data, mode, merge_str):
 
-    u_names = outfile[mode + '_u_names']
-    v_names = outfile[mode + '_v_names']
+    u_names = data[mode + '_u_names']
+    v_names = data[mode + '_v_names']
     try:
         text = np.concatenate([u_names, v_names], axis=1)
     except:
         text = np.concatenate(
             [u_names[:, np.newaxis], v_names[:, np.newaxis]], axis=1)
-    labels = outfile[mode + '_labels']
+    labels = data[mode + '_labels']
 
     text = [merge_str.format(text[i][0], text[i][1]) for i in range(text.shape[0])]
     dict = {
@@ -75,11 +77,7 @@ def load_txgnn_dataset_text(dataset, tokenizer):
     return tokenized_dataset, data_collator, task_type
 
 
-def load_txgnn_dataset_text_matrix(dataset, tokenizer):
-    path = os.path.join(DATA_PATH, '{}/matrix/test_matrix_{}.npz')
-    outfile = np.load(path.format(
-        'complex_disease_matrix', FILE_NAMES[dataset.split('_')[1]]))
-
+def load_txgnn_dataset_text_matrix(dataset, data, tokenizer, eval_bandit=False):
     if 'did' in dataset:
         merge_str = 'Is {} an effective treatment for {}?'
     elif 'dod' in dataset:
@@ -89,18 +87,26 @@ def load_txgnn_dataset_text_matrix(dataset, tokenizer):
     else:
         assert False, 'Reverse cases not yet supported'
 
-    u_names = outfile['u_names']
-    v_names = outfile['v_names']
-    try:
-        text = np.concatenate([u_names, v_names], axis=1)
-    except:
-        text = np.concatenate(
-            [outfile['u_names'][:, np.newaxis],
-             outfile['v_names'][:, np.newaxis]], axis=1)
+    u_names = data['u_names']
+    v_names = data['v_names']
 
-    text = [merge_str.format(text[i][0], text[i][1]) for i in range(text.shape[0])]
+    if eval_bandit:
+        text = np.concatenate(
+            [data['u_names'][..., np.newaxis],
+             data['v_names'][..., np.newaxis]], axis=-1)
+        join_fn = lambda x: merge_str.format(x[0], x[1])
+        text = np.apply_along_axis(join_fn, -1, text)
+    else:
+        try:
+            text = np.concatenate([u_names, v_names], axis=-1)
+        except:
+            text = np.concatenate(
+                [data['u_names'][:, np.newaxis],
+                data['v_names'][:, np.newaxis]], axis=-1)
+        text = [merge_str.format(text[i][0], text[i][1]) for i in range(text.shape[0])]
+
     full_dataset = DatasetDict(
-        {'matrix': Dataset.from_dict({'text': text})},
+        {'matrix': Dataset.from_dict({'text': text.flatten()})},
     )
 
     def _preprocess_function(examples):
@@ -204,34 +210,50 @@ def load_txgnn_dataset(dataset, dataset_type, model, batch_size, device):
     return train_loader, valid_loader, test_loader, num_train_points, data_dim, num_classes, inducing_x, tokenizer
 
 
-def load_txgnn_dataset_matrix(dataset, dataset_type, model, batch_size, device):
-    path = os.path.join(DATA_PATH, '{}/matrix/test_matrix_{}.npz')
+def load_txgnn_dataset_matrix(dataset, dataset_type, model, batch_size, device, eval_bandit=False):
+
+    if eval_bandit:
+        path = os.path.join(DATA_PATH, '{}/matrix/test_matrix_{}_bandit_eval.npz')
+    else:
+        path = os.path.join(DATA_PATH, '{}/matrix/test_matrix_{}.npz')
+
     data = np.load(path.format(
         'complex_disease_matrix', FILE_NAMES[dataset.split('_')[1]]))
 
     matrix_x = torch.Tensor(np.concatenate(
-        [data['h_u'], data['h_v']], axis=1)).to(device)
+        [data['h_u'], data['h_v']], axis=-1)).to(device)
+    matrix_y = torch.Tensor(data['labels']).to(device)
+
+    data_dim = matrix_x.shape[-1]
+    num_classes = 2
 
     if dataset_type == 'embedding':
-        matrix_set = torch.utils.data.TensorDataset(matrix_x)
+        matrix_set = torch.utils.data.TensorDataset(matrix_x, matrix_y)
         matrix_loader = torch.utils.data.DataLoader(
             matrix_set, batch_size=batch_size, shuffle=True)
         num_matrix_points = len(matrix_loader.dataset)
+
+        tokenizer = None
     elif dataset_type == 'embedding_text':
         # LLM input
         tokenizer = get_tokenizer(model)
         tokenized_dataset, _, task_type = load_txgnn_dataset_text_matrix(
-            dataset, tokenizer)
+            dataset, data, tokenizer, eval_bandit)
+
+        input_ids = torch.tensor(tokenized_dataset['matrix']['input_ids']).long()
+        attention_mask = torch.tensor(tokenized_dataset['matrix']['attention_mask']).long()
+        if eval_bandit:
+            # Shape [num_diseases, num_drugs, seq length]
+            input_ids = input_ids.reshape([NUM_DISEASES, NUM_DRUGS, -1])
+            attention_mask = attention_mask.reshape([NUM_DISEASES, NUM_DRUGS, -1])
 
         matrix_set = torch.utils.data.TensorDataset(
-            matrix_x,
-            torch.Tensor(tokenized_dataset['matrix']['input_ids']).long(),
-            torch.Tensor(tokenized_dataset['matrix']['attention_mask']).long())
+            matrix_x, input_ids, attention_mask, matrix_y)
         matrix_loader =  torch.utils.data.DataLoader(
             matrix_set, batch_size=batch_size, shuffle=True, drop_last=True)
         num_matrix_points = len(matrix_loader.dataset)
 
-    return matrix_loader, num_matrix_points
+    return matrix_loader, num_matrix_points, data_dim, num_classes, tokenizer
 
 
 def assemble_batch(batch, model_type, use_fromage, device, return_labels=True):

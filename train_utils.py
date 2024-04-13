@@ -98,7 +98,7 @@ def clip_grad_norm(model, llm, fromage_adapter, likelihood,
     return log_dict
 
 
-def forward_pass(model_type, use_fromage, model, llm, fromage_adapter, likelihood, model_input, labels, return_loss=True):
+def forward_pass(model_type, use_fromage, model, llm, fromage_adapter, likelihood, model_input, labels=None, loss_fn=None, return_loss=True):
     if 'dkl' == model_type:
         # Get predictive output
         output = model(**model_input)

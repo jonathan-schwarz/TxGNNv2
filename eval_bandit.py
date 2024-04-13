@@ -62,7 +62,7 @@ _REWARD_MATRIX  = np.array([[1, -1],
                             [-1, 3],
                             [2, -1],
                             [0, 1],
-                            [0, 1]])
+                            [0, 0]])
 
 
 def get_reward(predicted_outcome, true_outcome):
@@ -103,8 +103,8 @@ def main(argv):
     else:
         device = torch.device( "cpu")
 
-    ckpt_path = '/n/home06/jschwarz/git/TxGNNv2/checkpoints/finetune/txgnn_did_finetune_mlp_llama2_7b/model_ckpt_2024-04-12 10:59:46.100052'
-    # ckpt_path = '/n/home06/jschwarz/git/TxGNNv2/checkpoints/finetune/txgnn_did_finetune_dkl/model_ckpt_2024-04-12 10:34:01.493308'
+    ckpt_path = '/n/home06/jschwarz/git/TxGNNv2/checkpoints/finetune/txgnn_did_finetune_dkl/model_ckpt_2024-04-12 10:34:01.493308'
+    # ckpt_path = '/n/home06/jschwarz/git/TxGNNv2/checkpoints/finetune/txgnn_did_finetune_mlp_llama2_7b/model_ckpt_2024-04-12 10:59:46.100052'
 
     if FLAGS.wandb_track:
         config = {v: getattr(FLAGS, v) for v in dir(FLAGS)}
@@ -192,12 +192,12 @@ def main(argv):
             # Make predictions for all drugs
             for k in range(num_batches):
                 mini_batch = [b[k*FLAGS.eval_batch_size:(k+1)*FLAGS.eval_batch_size] for b in batch]
-                model_input, mini_batch_labels = _assemble_batch(mini_batch)
+                model_input = _assemble_batch(mini_batch, return_labels=False)
 
                 with torch.no_grad(), gpytorch.settings.num_likelihood_samples(1):
                     output = forward_pass(
                         FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
-                        model_input, mini_batch_labels, return_loss=False,
+                        model_input, return_loss=False,
                     )
 
                 pred_probs.append(output[0])
@@ -221,19 +221,24 @@ def main(argv):
             batch = new_batch
 
         print('Disease: {} Optimal reward: {} Real reward: {}'.format(i, optimal_reward, real_reward))
-        all_optimal_rewards.append(true_outcomes)
+        all_optimal_rewards.append(optimal_reward)
         all_real_rewards.append(real_reward)
         all_true_outcomes.append(true_outcomes)
         i += 1 
 
     if FLAGS.wandb_track:
         wandb.log({
-            "optimal_reward_mean": np.mean(optimal_rewards),
-            "optimal_reward_std": np.std(optimal_rewards),
-            "real_reward_mean": np.mean(real_rewards), 
-            "real_reward_std": np.std(real_rewards), 
-            "all_true_outcomes": np.array(all_true_outcomes), 
+            "optimal_reward_mean": np.mean(all_optimal_rewards),
+            "optimal_reward_std": np.std(all_optimal_rewards),
+            "real_reward_mean": np.mean(all_real_rewards),
+            "real_reward_std": np.std(all_real_rewards),
         })
+
+        np.savez_compressed(
+            os.path.join(ckpt_path, 'bandit_eval_outcomes'),
+            true_outcomes=np.array(all_true_outcomes),
+        )
+        wandb.save(os.path.join(ckpt_path, 'bandit_eval_outcomes.npz'))
 
 
 

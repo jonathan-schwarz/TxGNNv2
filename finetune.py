@@ -24,6 +24,7 @@ FLAGS = flags.FLAGS
 
 # Training settings
 flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
+flags.DEFINE_integer('eval_batch_size', 128, 'Evaluation Batch size.', lower_bound=1)
 flags.DEFINE_integer('n_epochs', 1, 'Number of epochs.', lower_bound=1)
 flags.DEFINE_integer('n_max_steps', -1, 'Maximum number of training steps.', lower_bound=-1)
 
@@ -225,7 +226,7 @@ def main(argv):
 
                 pred_prob, pred_label, loss = forward_pass(
                     FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
-                    model_input, labels, return_loss=True,
+                    model_input, labels, loss_fn,
                 )
 
                 try:
@@ -276,7 +277,7 @@ def main(argv):
 
                             pred_prob, pred_label, loss = forward_pass(
                                 FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
-                                model_input, labels, return_loss=True,
+                                model_input, labels, loss_fn,
                             )
                             valid_loss += loss
 
@@ -354,7 +355,7 @@ def main(argv):
 
             pred_prob, pred_label, loss = forward_pass(
                 FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
-                model_input, labels, return_loss=True,
+                model_input, labels, loss_fn,
             )
             test_loss += loss
 
@@ -403,9 +404,10 @@ def main(argv):
         )
         wandb.save(os.path.join(ckpt_path, 'predictions.npz'))
 
+        # Final evaluation over entire Drug/Disease Matrix
         if FLAGS.full_matrix_eval:
-            matrix_loader, num_matrix_points = load_txgnn_dataset_matrix(
-                FLAGS.dataset, dataset_type, FLAGS.model, FLAGS.batch_size, device,
+            matrix_loader, num_matrix_points, _, _, _ = load_txgnn_dataset_matrix(
+                FLAGS.dataset, dataset_type, FLAGS.model, FLAGS.eval_batch_size, device, eval_bandit=False,
             )
             print('Evaluating on matrix set')
             matrix_predictions = [] 
@@ -416,7 +418,7 @@ def main(argv):
 
                     pred_prob, _ = forward_pass(
                         FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
-                        model_input, labels, return_loss=False,
+                        model_input, return_loss=False
                     )
 
                     matrix_predictions.append(pred_prob.cpu().numpy())

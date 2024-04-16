@@ -166,15 +166,16 @@ def load_txgnn_dataset(dataset, dataset_type, model, batch_size, device):
     if dataset_type == 'embedding':
         tokenizer = None  # Unused
 
+        # We are shuffling in all cases to avoid ROC computation errors
         train_set = torch.utils.data.TensorDataset(train[0], train[1])
         train_loader = torch.utils.data.DataLoader(
             train_set, batch_size=batch_size, shuffle=True)
         valid_set = torch.utils.data.TensorDataset(valid[0], valid[1])
         valid_loader = torch.utils.data.DataLoader(
-            valid_set, batch_size=num_valid_points, shuffle=False)
+            valid_set, batch_size=num_valid_points, shuffle=True)
         test_set = torch.utils.data.TensorDataset(test[0], test[1])
         test_loader = torch.utils.data.DataLoader(
-            test_set, batch_size=num_test_points, shuffle=False)
+            test_set, batch_size=num_test_points, shuffle=True)
     elif dataset_type == 'embedding_text':
         # LLM input
         tokenizer = get_tokenizer(model)
@@ -221,7 +222,7 @@ def load_txgnn_dataset_matrix(dataset, dataset_type, model, batch_size, device, 
     if dataset_type == 'embedding':
         matrix_set = torch.utils.data.TensorDataset(matrix_x, matrix_y)
         matrix_loader = torch.utils.data.DataLoader(
-            matrix_set, batch_size=batch_size, shuffle=True)
+            matrix_set, batch_size=batch_size, shuffle=False, drop_last=False)
         num_matrix_points = len(matrix_loader.dataset)
 
         tokenizer = None

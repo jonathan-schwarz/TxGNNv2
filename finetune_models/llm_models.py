@@ -60,7 +60,7 @@ def get_tokenizer(model_type):
     if 'distilbert' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'distilbert-base-uncased', cache_dir=CACHE_PATH)
-    elif  'mixtral' in model_type:
+    elif 'mixtral' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'mistralai/Mixtral-8x7B-v0.1', cache_dir=CACHE_PATH)
         # TODO(schwarzjn): Double check

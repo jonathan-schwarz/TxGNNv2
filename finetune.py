@@ -43,12 +43,13 @@ flags.DEFINE_integer('hidden_dim', 256, 'DKL Hidden Dim.', lower_bound=1)
 flags.DEFINE_integer('n_layers', 3, 'DKL Hidden Layers.', lower_bound=1)
 # Only for LLMs
 flags.DEFINE_boolean('use_fromage', True, 'Whether to use GNN features in LLM predictive model.')
+flags.DEFINE_enum('fromage_type', 'p_tuning', ['p_tuning'], 'Method to condition on GNN embeddings')
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
 flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora', 'none'], 'LLM Finetunting type. Disabled when `none`')
 # Only for DKL
 flags.DEFINE_enum('strategy', 'grid_interpolation',
                   ['grid_interpolation', 'unwhitened'], 'Variational Strategy.')
-flags.DEFINE_boolean('wandb_track', False, 'Whether to use wandb.')
+flags.DEFINE_boolean('wandb_track', True, 'Whether to use wandb.')
 
 
 # Misc
@@ -129,6 +130,12 @@ def main(argv):
                                         device=device)
 
     # Build model
+    fromage_settings = {
+        'use_fromage': FLAGS.use_fromage,
+        'fromage_type': FLAGS.fromage_type,
+        'gnn_data_dim': data_dim,
+    }
+
     fromage_adapter = None
     llm = None
     if 'llama' in FLAGS.model:
@@ -143,10 +150,13 @@ def main(argv):
 
         if FLAGS.use_fromage:
             # Adapter for GNN features
-            gnn_data_dim = 1024
+            fromage_settings['data_dim'] = data_dim
             fromage_adapter = get_fromage_adapter(
-                gnn_data_dim // 2, FLAGS.hidden_dim, FLAGS.n_layers, data_dim, llm.device)
-
+                fromage_settings['gnn_data_dim'] // 2,
+                FLAGS.hidden_dim,
+                FLAGS.n_layers,
+                data_dim,
+                llm.device)
 
     # Predictive model
     model, likelihood = get_model(
@@ -196,6 +206,7 @@ def main(argv):
             wandb.watch(model, log_freq=25)
 
     # TODO(schwarzjn): Enabled paged optimizer
+    # TODO(schwarzjn): Try AdamW. Check if the definition of per-param weight decay above is compatible
     optimizer = torch.optim.Adam(params, lr=FLAGS.learning_rate)
     scheduler = load_scheduler(FLAGS.scheduler_type, optimizer, FLAGS.n_epochs, 
                                num_train_points // FLAGS.batch_size)
@@ -225,7 +236,8 @@ def main(argv):
                 model_input, labels = _assemble_batch(batch)
 
                 pred_prob, pred_label, loss = forward_pass(
-                    FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                    FLAGS.model, fromage_settings,
+                    model, llm, fromage_adapter, likelihood,
                     model_input, labels, loss_fn,
                 )
 
@@ -276,7 +288,8 @@ def main(argv):
                             model_input, labels = _assemble_batch(valid_batch)
 
                             pred_prob, pred_label, loss = forward_pass(
-                                FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                                FLAGS.model, fromage_settings,
+                                model, llm, fromage_adapter, likelihood,
                                 model_input, labels, loss_fn,
                             )
                             valid_loss += loss
@@ -354,7 +367,8 @@ def main(argv):
             model_input, labels = _assemble_batch(test_batch)
 
             pred_prob, pred_label, loss = forward_pass(
-                FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                FLAGS.model, fromage_settings,
+                model, llm, fromage_adapter, likelihood,
                 model_input, labels, loss_fn,
             )
             test_loss += loss
@@ -417,7 +431,8 @@ def main(argv):
                     model_input = _assemble_batch(batch, return_labels=False)
 
                     pred_prob, _ = forward_pass(
-                        FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                        FLAGS.model, FLAGS.use_fromage,
+                        model, llm, fromage_adapter, likelihood,
                         model_input, return_loss=False
                     )
 

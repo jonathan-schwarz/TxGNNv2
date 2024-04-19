@@ -142,6 +142,12 @@ def main(argv):
     inducing_x = None
 
     # Build model
+    fromage_settings = {
+        'use_fromage': FLAGS.use_fromage,
+        'fromage_type': FLAGS.fromage_type,
+        'gnn_data_dim': data_dim,
+    }
+
     fromage_adapter = None
     llm = None
     if 'llama' in FLAGS.model:
@@ -156,10 +162,13 @@ def main(argv):
 
         if FLAGS.use_fromage:
             # Adapter for GNN features
-            gnn_data_dim = 1024
+            fromage_settings['data_dim'] = data_dim
             fromage_adapter = get_fromage_adapter(
-                gnn_data_dim // 2, FLAGS.hidden_dim, FLAGS.n_layers, data_dim, llm.device)
-
+                fromage_settings['gnn_data_dim'] // 2,
+                FLAGS.hidden_dim,
+                FLAGS.n_layers,
+                data_dim,
+                llm.device)
 
     # Predictive model
     model, likelihood = get_model(
@@ -199,7 +208,8 @@ def main(argv):
             model_input, labels = _assemble_batch(test_batch)
 
             pred_prob, pred_label, loss = forward_pass(
-                FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                FLAGS.model, fromage_settings,
+                model, llm, fromage_adapter, likelihood,
                 model_input, labels, loss_fn,
             )
             test_loss += loss
@@ -270,7 +280,8 @@ def main(argv):
 
                     with torch.no_grad(), gpytorch.settings.num_likelihood_samples(16):
                         output = forward_pass(
-                            FLAGS.model, FLAGS.use_fromage, model, llm, fromage_adapter, likelihood,
+                            FLAGS.model, fromage_settings,
+                             model, llm, fromage_adapter, likelihood,
                             model_input, return_loss=False,
                         )
 

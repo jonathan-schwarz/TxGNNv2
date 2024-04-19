@@ -41,6 +41,7 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        fromage_type: Optional[dict] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -51,10 +52,15 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if gnn_embeddings is not None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
-            inputs_embeds = torch.concat([gnn_embeddings, inputs_embeds], axis=1)
-            attention_mask = torch.concat([torch.ones_like(attention_mask[:, :2]), attention_mask], axis=1)
-            input_ids = None
+            prefix_attention_mask = torch.ones_like(attention_mask[:, :2]).to(self.model.device)
+            attention_mask = torch.concat([prefix_attention_mask, attention_mask], axis=1)
+            import pdb; pdb.set_trace()
+            if fromage_type == 'p_tuning':
+                inputs_embeds = self.model.embed_tokens(input_ids)
+                inputs_embeds = torch.concat([gnn_embeddings, inputs_embeds], axis=1)
+                input_ids = None
+            elif fromage_type == 'p_tuning_v2':
+                pass
 
         transformer_outputs = self.model(
             input_ids,

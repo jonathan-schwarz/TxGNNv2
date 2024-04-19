@@ -98,7 +98,7 @@ def clip_grad_norm(model, llm, fromage_adapter, likelihood,
     return log_dict
 
 
-def forward_pass(model_type, use_fromage, model, llm, fromage_adapter, likelihood, model_input, labels=None, loss_fn=None, return_loss=True):
+def forward_pass(model_type, fromage_settings, model, llm, fromage_adapter, likelihood, model_input, labels=None, loss_fn=None, return_loss=True):
     if 'dkl' == model_type:
         # Get predictive output
         output = model(**model_input)
@@ -107,16 +107,19 @@ def forward_pass(model_type, use_fromage, model, llm, fromage_adapter, likelihoo
         pred_prob = likelihood(output).probs.mean(0)[:, 1]
     elif 'llama2_7b' in model_type:
 
-        if use_fromage:
+        if fromage_settings['use_fromage']:
             # Embedding each drug / disease feature separately
             # TODO(schwarzjn): Should we process drug/disease embedding separately?
+            bs = model_input['gnn_embeddings'].shape[0]
             fromage_features = fromage_adapter(
-                model_input['gnn_embeddings'].reshape([FLAGS.batch_size*2, gnn_data_dim // 2])
-            ).reshape([FLAGS.batch_size, 2, data_dim])
+                model_input['gnn_embeddings'].reshape([bs*2, fromage_settings['gnn_data_dim'] // 2])
+            ).reshape([bs, 2, fromage_settings['data_dim']])
             model_input['gnn_embeddings'] = fromage_features
+            model_input['fromage_type'] = fromage_settings['fromage_type']
 
         # Apply LLM
         llm_output = llm(**model_input).to(torch.float32)
+
         if 'mlp' in model_type:
             # Apply Linear output
             output = model(llm_output)

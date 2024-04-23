@@ -69,12 +69,16 @@ def get_tokenizer(model_type):
     elif  'llama2_7b' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'NousResearch/Llama-2-7b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
-        # TODO(schwarzjn): Double check
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
     elif  'llama2_13b'in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'NousResearch/Llama-2-13b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
+    elif  'llama3_8b' in model_type:
+        tokenizer = AutoTokenizer.from_pretrained(
+            'meta-llama/Meta-Llama-3-8B', trust_remote_code=True, cache_dir=CACHE_PATH)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
 
@@ -107,7 +111,6 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
             print('Your GPU supports bfloat16: accelerating training with use_bf16=True')
             print('=' * 80)
             use_bf16 = True
-
     if 'distilbert' == model_type:
         # No quantization necessary for DistilBert (small model)
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -128,39 +131,31 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
             label2id=LABEL2ID,
             cache_dir=CACHE_PATH,
         )
-
-        model.config.use_cache = True
-    elif 'llama2' in model_type:
+    elif 'llama' in model_type:
 
         if'llama2_7b' in model_type:
             model_name = 'NousResearch/Llama-2-7b-hf'
         elif'llama2_13b' in model_type:
             model_name = 'NousResearch/Llama-2-13b-hf'
+        elif'llama3_8b' in model_type:
+            model_name = 'meta-llama/Meta-Llama-3-8B'
 
-        if '_llama2_7b' in model_type:
-            # Custom version
-            model = LlamaForCustomSequenceClassification.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map=device_map,
-                cache_dir=CACHE_PATH,
-                num_labels=2,
-                id2label=ID2LABEL,
-                label2id=LABEL2ID,
-            )
-        else:
-            model = AutoModelForSequenceClassification.from_pretrained(
-                model_name,
-                quantization_config=bnb_config,
-                device_map=device_map,
-                num_labels=2,
-                id2label=ID2LABEL,
-                label2id=LABEL2ID,
-                cache_dir=CACHE_PATH,
-            )
+        # Custom version
+        model = LlamaForCustomSequenceClassification.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            num_labels=2,
+            id2label=ID2LABEL,
+            label2id=LABEL2ID,
+            cache_dir=CACHE_PATH,
+        )
+        model.config.pad_token_id = model.config.eos_token_id
 
-        model.config.use_cache = False
+        # Activate the more accurate but slower computation of the linear layers
         model.config.pretraining_tp = 1
+
+    model.config.use_cache = False
 
     print('=' * 80)
     print('Model loaded. ' + _get_gpu_utilization())
@@ -180,9 +175,7 @@ def get_peft(model, task_type, finetune_type, lora_apply_everywhere, use_final_l
             'r': 64,
             'bias': 'none',
         }
-        # TODO(schwarzjn): Check
-        # if use_final_layer:
-        #    kwargs['modules_to_save'] = 'score'
+
         if not lora_apply_everywhere:
             kwargs['target_modules'] = ['q_proj', 'k_proj', 'v_proj']  # 'out_proj', 'fc_in', 'fc_out', 'wte']
 

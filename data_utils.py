@@ -38,6 +38,7 @@ def load_split(data, mode, merge_str):
     labels = data[mode + '_labels']
 
     text = [merge_str.format(text[i][0], text[i][1]) for i in range(text.shape[0])]
+
     dict = {
         'text': text,
         'label': labels.astype(np.int64)[:, 0].tolist(),
@@ -47,13 +48,18 @@ def load_split(data, mode, merge_str):
     return dataset
 
 
-def load_txgnn_dataset_text(dataset, tokenizer):
+def load_txgnn_dataset_text(dataset, tokenizer, prompt_version):
     path = os.path.join(DATA_PATH, '{}/separate/{}.npz')
     data = np.load(path.format(
         DATASET_VERSION, FILE_NAMES[dataset.split('_')[1]]))
 
     if 'did' in dataset:
-        merge_str = 'Is {} an effective treatment for {}?'
+        if 'v1' == prompt_version:
+            merge_str = 'Is {} an effective treatment for {}?'
+        elif 'v2' == prompt_version:
+            merge_str = 'Is this drug an effective treatment for the disease?'
+        else:
+            assert False
     elif 'dod' in dataset:
         merge_str = 'Is {} effective for off-label use on {}?'
     elif 'dcd' in dataset:
@@ -68,7 +74,7 @@ def load_txgnn_dataset_text(dataset, tokenizer):
     )
 
     def _preprocess_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=MAX_LENGTH, pad_to_max_length=True)
+        return tokenizer(examples["text"], truncation=True, padding='max_length', max_length=MAX_LENGTH)
 
     tokenized_dataset = full_dataset.map(_preprocess_function, batched=True)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -100,7 +106,7 @@ def load_txgnn_dataset_text_matrix(dataset, data, tokenizer):
     )
 
     def _preprocess_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=MAX_LENGTH, pad_to_max_length=True)
+        return tokenizer(examples["text"], truncation=True, padding='max_length', max_length=MAX_LENGTH)
 
     tokenized_dataset = full_dataset.map(_preprocess_function, batched=True)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -114,6 +120,7 @@ def load_txgnn_dataset_raw(dataset, device):
     data = np.load(path.format(
         DATASET_VERSION, FILE_NAMES[dataset.split('_')[1]]))
 
+    # u: drugs, v: diseases
     train_x = torch.Tensor(np.concatenate(
         [data['train_h_u'], data['train_h_v']], axis=1)).to(device)
     train_y = torch.Tensor(data['train_labels']).to(device)
@@ -150,7 +157,7 @@ def load_txgnn_dataset_raw(dataset, device):
     return (train_x, train_y, train_names), (valid_x, valid_y, valid_names), (test_x, test_y, test_names)
 
 
-def load_txgnn_dataset(dataset, dataset_type, model, batch_size, device):
+def load_txgnn_dataset(dataset, dataset_type, prompt_version, model, batch_size, device):
     # Format: (features, labels, drug/disease names)
     train, valid, test = load_txgnn_dataset_raw(dataset, device)
 
@@ -180,8 +187,7 @@ def load_txgnn_dataset(dataset, dataset_type, model, batch_size, device):
         # LLM input
         tokenizer = get_tokenizer(model)
         tokenized_dataset, _, task_type = load_txgnn_dataset_text(
-            dataset, tokenizer)
-
+            dataset, tokenizer, prompt_version)
 
         def _build_dataset(gnn_features, labels, _tokenized_dataset):
             # TODO(schwarzjn): Fix code to avoid `drop_last`
@@ -201,7 +207,8 @@ def load_txgnn_dataset(dataset, dataset_type, model, batch_size, device):
     return train_loader, valid_loader, test_loader, num_train_points, data_dim, num_classes, inducing_x, tokenizer
 
 
-def load_txgnn_dataset_matrix(dataset, dataset_type, model, batch_size, device, eval_bandit=False):
+def load_txgnn_dataset_matrix(dataset, dataset_type, prompt_version,
+                              model, batch_size, device, eval_bandit=False):
 
     if eval_bandit:
         path = os.path.join(DATA_PATH, '{}/matrix/test_matrix_{}_bandit_eval.npz')

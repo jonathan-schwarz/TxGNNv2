@@ -259,7 +259,7 @@ def load_txgnn_dataset_matrix(dataset, dataset_type, prompt_version,
     return matrix_loader, num_matrix_points, data_dim, num_classes, tokenizer
 
 
-def assemble_batch(batch, model_type, use_fromage, device, return_labels=True):
+def assemble_batch(batch, model_type, device, return_labels=True):
     if 'llm' in model_type:
         model_input = {
             'input_ids': batch[1].to(device),
@@ -268,8 +268,7 @@ def assemble_batch(batch, model_type, use_fromage, device, return_labels=True):
         if return_labels:
             labels = batch[3].to(device)
 
-        if use_fromage:
-            model_input['gnn_embeddings'] = batch[0].to(device)
+        model_input['gnn_embeddings'] = batch[0].to(device)
     else:
         train_x = batch[0].to(device)
         if return_labels:

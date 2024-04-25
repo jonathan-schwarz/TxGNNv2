@@ -16,6 +16,8 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         self.num_labels = config.num_labels
         self.model = LlamaModel(config)
 
+        # TODO(schwarzjn): Introduce dropout?
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -25,6 +27,24 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
+    def get_v2_tuning_prompts(self, fromage_features, batch_size):
+        past_key_values = None
+
+        prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1).to(self.bert.device)
+        past_key_values = self.prefix_encoder(prefix_tokens)
+        bsz, seqlen, _ = past_key_values.shape
+        past_key_values = past_key_values.view(
+            bsz,
+            seqlen,
+            self.n_layer * 2,
+            self.n_head,
+            self.n_embd
+        )
+        past_key_values = self.dropout(past_key_values)
+        past_key_values = past_key_values.permute([2, 0, 3, 1, 4]).split(2)
+
+        return past_key_values
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -32,7 +52,6 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        gnn_embeddings: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -56,21 +75,28 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         if fromage_settings['use_fromage'] and 'top_only' != fromage_settings['fromage_type']:
             inputs_embeds = self.model.embed_tokens(input_ids)
             input_ids = None
+
+            pre_seq_len = fromage_settings['fromage_features'].shape[1]
             if 'p_tuning' in fromage_settings['fromage_type']:
-                prefix_inputs_embeds = gnn_embeddings
-                prefix_attention_mask = torch.ones_like(attention_mask[:, :2]).to(self.model.device)
+                prefix_inputs_embeds = fromage_settings['fromage_features']
+                prefix_attention_mask = torch.ones([batch_size, pre_seq_len]).to(self.model.device)
+                inputs_embeds = torch.concat([prefix_inputs_embeds, inputs_embeds], axis=1)
             elif 'text_tuning' in fromage_settings['fromage_type']:
                 explanation_ids = [self.model.embed_tokens(f)
                                    for f in fromage_settings['text_ids']]
                 prefix_inputs_embeds = torch.concat([
-                    explanation_ids[0], gnn_embeddings[:, :1, :],  # Drug Embedding
-                    explanation_ids[1], gnn_embeddings[:, 1:, :],  # Disease Embedding
+                    explanation_ids[0], fromage_settings['fromage_features'][:, :1, :],  # Drug Embedding
+                    explanation_ids[1], fromage_settings['fromage_features'][:, 1:, :],  # Disease Embedding
                     explanation_ids[2]], axis=1)  # Query
                 prefix_attention_mask = torch.ones_like(attention_mask[:, :prefix_inputs_embeds.shape[1]])
+                inputs_embeds = torch.concat([prefix_inputs_embeds, inputs_embeds], axis=1)
+            elif 'v2_tuning' in fromage_settings['fromage_type']:
+                assert False, 'not yet ready'
+                past_key_values = self.get_v2_tuning_prompts(fromage_settings['fromage_features'])
+                prefix_attention_mask = torch.ones([batch_size, pre_seq_len]).to(self.model.device)
             else:
                 assert False
 
-            inputs_embeds = torch.concat([prefix_inputs_embeds, inputs_embeds], axis=1)
             attention_mask = torch.concat([prefix_attention_mask, attention_mask], axis=1)
 
         transformer_outputs = self.model(

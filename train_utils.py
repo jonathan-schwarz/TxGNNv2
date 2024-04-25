@@ -106,22 +106,25 @@ def forward_pass(model_type, fromage_settings, model, llm, fromage_adapter, like
             loss = -loss_fn(output, labels[:, 0])
         pred_prob = likelihood(output).probs.mean(0)[:, 1]
     elif 'llm' in model_type:
-        model_input['fromage_settings'] = fromage_settings
-        if fromage_settings['use_fromage'] and 'top' != fromage_settings['fromage_type']:
+        gnn_embeddings = model_input['gnn_embeddings']
+        del model_input['gnn_embeddings']
+
+        if fromage_settings['use_fromage'] and 'top_only' != fromage_settings['fromage_type']:
             # Embedding each drug / disease feature separately
             # TODO(schwarzjn): Should we process drug/disease embedding separately?
-            bs = model_input['gnn_embeddings'].shape[0]
+            batch_size = gnn_embeddings.shape[0]
             fromage_features = fromage_adapter(
-                model_input['gnn_embeddings'].reshape([bs*2, fromage_settings['gnn_data_dim'] // 2])
-            ).reshape([bs, 2, fromage_settings['data_dim']])
-            model_input['gnn_embeddings'] = fromage_features
+                gnn_embeddings.view([batch_size, 2, fromage_settings['gnn_data_dim'] // 2])
+            )
+            fromage_settings['fromage_features'] = fromage_features
 
         # Apply LLM
+        model_input['fromage_settings'] = fromage_settings
         llm_output = llm(**model_input).to(torch.float32)
 
         # Optionally pass output of transformer together with GNN to predictive module
         if fromage_settings['use_fromage'] and 'top' in fromage_settings['fromage_type']:
-            llm_output = torch.concat([llm_output, model_input['gnn_embeddings']], axis=-1)
+            llm_output = torch.concat([llm_output, gnn_embeddings], axis=-1)
 
         if 'mlp' in model_type:
             # Apply Linear/MLP predictor

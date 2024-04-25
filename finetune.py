@@ -43,19 +43,22 @@ flags.DEFINE_float('max_grad_norm', 10.0, 'Used for optional gradient clipping')
 flags.DEFINE_float('dkl_learning_rate_multiplier', 0.01, 'LR factor for GP hyperparameters')
 flags.DEFINE_float('weight_decay', 1e-4, 'Weight decay for feature extractor')
 flags.DEFINE_enum('scheduler_type', 'cosine_decay_with_warmup', ['constant', 'cosine_decay', 'cosine_decay_with_warmup', 'multi_step_lr', 'valid_plateau'], 'LR Scheduler.')
-flags.DEFINE_integer('grid_size', 64, 'DKL Grid size', lower_bound=2)
-flags.DEFINE_integer('final_dim', 256, 'DKL Final Dim.', lower_bound=1)
-flags.DEFINE_integer('hidden_dim', 256, 'DKL Hidden Dim.', lower_bound=1)
-flags.DEFINE_integer('n_layers', 3, 'DKL Hidden Layers.', lower_bound=1)
+flags.DEFINE_integer('final_dim', 256, 'Predictor final Dim.', lower_bound=1)
+flags.DEFINE_integer('hidden_dim', 256, 'Predictor DKL nidden Dim.', lower_bound=1)
+flags.DEFINE_integer('n_layers', 3, 'Predictor hidden Layers.', lower_bound=1)
 # Only for LLMs
 flags.DEFINE_boolean('use_fromage', True, 'Whether to use GNN features in LLM predictive model.')
-flags.DEFINE_enum('fromage_type', 'p_tuning', ['p_tuning', 'v2_tuning', 'text_tuning', 'top_only'], 'Method to condition on GNN embeddings')
+flags.DEFINE_enum('fromage_type', 'p_tuning', ['p_tuning', 'v2_tuning', 'text_tuning', 'top_only',
+                                               'p_tuning_top', 'v2_tuning_top', 'text_tuning_top'], 'Method to condition on GNN embeddings')
+flags.DEFINE_integer('fromage_hidden_dim', 512, 'Fromage adapter hidden dim.', lower_bound=1)
+flags.DEFINE_integer('fromage_n_layers', 2, 'Fromage adapter hidden layers.', lower_bound=1)
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
 flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora', 'none'], 'LLM Finetunting type. Disabled when `none`')
 flags.DEFINE_enum('prompt_version', 'v1', ['v1'], 'Different prompt versions')
 # Only for DKL
 flags.DEFINE_enum('strategy', 'grid_interpolation',
                   ['grid_interpolation', 'unwhitened'], 'Variational Strategy.')
+flags.DEFINE_integer('grid_size', 64, 'DKL Grid size', lower_bound=2)
 
 
 # Misc
@@ -134,7 +137,6 @@ def main(argv):
 
     _assemble_batch = functools.partial(assemble_batch,
                                         model_type=FLAGS.model,
-                                        use_fromage=FLAGS.use_fromage,
                                         device=device)
 
     # Build model
@@ -160,10 +162,9 @@ def main(argv):
             fromage_settings['data_dim'] = data_dim
             fromage_adapter = get_fromage_adapter(
                 fromage_settings['gnn_data_dim'] // 2,
-                FLAGS.hidden_dim,
-                FLAGS.n_layers,
-                data_dim,
-                llm.device)
+                FLAGS.fromage_hidden_dim,
+                FLAGS.fromage_n_layers,
+                data_dim, llm.device)  # here `data_dim` is the embedding dimension
 
             if 'text_tuning' in FLAGS.fromage_type:
                 # Will add graph embeddings in between

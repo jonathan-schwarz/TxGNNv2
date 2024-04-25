@@ -7,7 +7,7 @@ import os
 from datasets import load_dataset, Dataset, DatasetDict
 from transformers import DataCollatorWithPadding
 
-from finetune_models.llm_models import get_tokenizer
+from models.llm_models import get_tokenizer
 
 DATA_PATH = '/n/holystore01/LABS/mzitnik_lab/Users/jschwarz/TxGNNv2/data/pretrained_mine/'
 DATASET_VERSION = 'complex_disease_matrix'
@@ -56,14 +56,18 @@ def load_txgnn_dataset_text(dataset, tokenizer, prompt_version):
     if 'did' in dataset:
         if 'v1' == prompt_version:
             merge_str = 'Is {} an effective treatment for {}?'
-        elif 'v2' == prompt_version:
-            merge_str = 'Is this drug an effective treatment for the disease?'
         else:
-            assert False
+            assert False, 'Invalid choice'
     elif 'dod' in dataset:
-        merge_str = 'Is {} effective for off-label use on {}?'
+        if 'v1' == prompt_version:
+            merge_str = 'Is {} effective for off-label use on {}?'
+        else:
+            assert False, 'Invalid choice'
     elif 'dcd' in dataset:
-        merge_str = 'Should {} be avoided for patients suffering from {}?'
+        if 'v1' == prompt_version:
+            merge_str = 'Should {} be avoided for patients suffering from {}?'
+        else:
+            assert False, 'Invalid choice'
     else:
         assert False, 'Reverse cases not yet supported'
 
@@ -256,7 +260,7 @@ def load_txgnn_dataset_matrix(dataset, dataset_type, prompt_version,
 
 
 def assemble_batch(batch, model_type, use_fromage, device, return_labels=True):
-    if 'llama' in model_type:
+    if 'llm' in model_type:
         model_input = {
             'input_ids': batch[1].to(device),
             'attention_mask': batch[2].to(device),

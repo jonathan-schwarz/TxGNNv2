@@ -17,11 +17,12 @@ from transformers import (
     BitsAndBytesConfig,
     pipeline,
 )
-from .custom_llama import LlamaForCustomSequenceClassification
-from .models import FeatureExtractor
 from peft import LoraConfig
 
-accuracy = evaluate.load('accuracy')
+from .custom_gemma import *
+from .custom_llama import *
+from .custom_mistral import *
+from .models import FeatureExtractor
 
 ID2LABEL = {0: 'NEGATIVE', 1: 'POSITIVE'}
 LABEL2ID = {'NEGATIVE': 0, 'POSITIVE': 1}
@@ -39,46 +40,34 @@ def _get_gpu_utilization():
     return f'GPU memory occupied: {info.used//1024**2} MB.'
 
 
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    full_pred_probs = softmax(logits, axis=1)
-    pred_probs = full_pred_probs[:, 1]
-    pred_label = np.argmax(logits, axis=1)
-
-    correct_prediction_probs = 1.0 - full_pred_probs[
-        range(labels.shape[0]), labels.astype(np.int32).flatten()][:, np.newaxis]
-
-    metric_dict = accuracy.compute(predictions=pred_label, references=labels)
-    metric_dict['auroc'] = roc_auc_score(labels, pred_probs)
-    metric_dict['auprc'] = average_precision_score(labels, pred_probs)
-    metric_dict['auroc_auprc'] = metric_dict['auroc'] * metric_dict['auprc']
-    return metric_dict
-
-
 def get_tokenizer(model_type):
     # Load relevant tokenizer
     if 'distilbert' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'distilbert-base-uncased', cache_dir=CACHE_PATH)
-    elif 'mixtral' in model_type:
+    elif 'gemma_7b' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
-            'mistralai/Mixtral-8x7B-v0.1', cache_dir=CACHE_PATH)
-        # TODO(schwarzjn): Double check
+            'google/gemma-7b', trust_remote_code=True, cache_dir=CACHE_PATH)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
-    elif  'llama2_7b' in model_type:
+    elif 'llama2_7b' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'NousResearch/Llama-2-7b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
-    elif  'llama2_13b'in model_type:
+    elif 'llama2_13b'in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'NousResearch/Llama-2-13b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
-    elif  'llama3_8b' in model_type:
+    elif 'llama3_8b' in model_type:
         tokenizer = AutoTokenizer.from_pretrained(
             'meta-llama/Meta-Llama-3-8B', trust_remote_code=True, cache_dir=CACHE_PATH)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
+    elif 'mistral_7b' in model_type:
+        tokenizer = AutoTokenizer.from_pretrained(
+            'mistralai/Mistral-7B-v0.1', cache_dir=CACHE_PATH)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
 
@@ -121,9 +110,17 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
             label2id=LABEL2ID,
             cache_dir=CACHE_PATH,
         )
-    elif 'mixtral' in model_type:
-        model = AutoModelForSequenceClassification.from_pretrained(
-            'mistralai/Mixtral-8x7B-v0.1',
+
+        # Embedding dimension
+        data_dim = 3072
+    elif 'gemma' in model_type:
+
+        if'gemma_7b' in model_type:
+            model_name = 'google/gemma-7b'
+
+        # Custom version
+        model = GemmaForCustomSequenceClassification.from_pretrained(
+            model_name,
             quantization_config=bnb_config,
             device_map=device_map,
             num_labels=2,
@@ -131,9 +128,15 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
             label2id=LABEL2ID,
             cache_dir=CACHE_PATH,
         )
+        model.config.pad_token_id = model.config.eos_token_id
+
+        # Embedding dimension
+        data_dim = 3072
     elif 'llama' in model_type:
 
-        if'llama2_7b' in model_type:
+        if'llama_7b' in model_type:
+            model_name = 'NousResearch/Llama-2-7b-hf'
+        elif'llama2_7b' in model_type:
             model_name = 'NousResearch/Llama-2-7b-hf'
         elif'llama2_13b' in model_type:
             model_name = 'NousResearch/Llama-2-13b-hf'
@@ -155,13 +158,35 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
         # Activate the more accurate but slower computation of the linear layers
         model.config.pretraining_tp = 1
 
+        # Embedding dimension
+        data_dim = 4096
+    elif 'mistral' in model_type:
+
+        if'mistral_7b' in model_type:
+            model_name = 'mistralai/Mistral-7B-v0.1'
+
+        # Custom version
+        model = MistralForCustomSequenceClassification.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            num_labels=2,
+            id2label=ID2LABEL,
+            label2id=LABEL2ID,
+            cache_dir=CACHE_PATH,
+        )
+        model.config.pad_token_id = model.config.eos_token_id
+
+        # Embedding dimension
+        data_dim = 4096
+
     model.config.use_cache = False
 
     print('=' * 80)
     print('Model loaded. ' + _get_gpu_utilization())
     print('=' * 80)
 
-    return model, use_bf16
+    return model, use_bf16, data_dim
 
 
 def get_peft(model, task_type, finetune_type, lora_apply_everywhere, use_final_layer=True):
@@ -177,7 +202,9 @@ def get_peft(model, task_type, finetune_type, lora_apply_everywhere, use_final_l
         }
 
         if not lora_apply_everywhere:
-            kwargs['target_modules'] = ['q_proj', 'k_proj', 'v_proj']  # 'out_proj', 'fc_in', 'fc_out', 'wte']
+            kwargs['target_modules'] = ['q_proj', 'k_proj', 'v_proj']
+        else:
+            kwargs['target_modules'] = ['q_proj', 'k_proj', 'v_proj', 'out_proj', 'fc_in', 'fc_out', 'wte']
 
         peft_config = LoraConfig(**kwargs)
         optim = 'paged_adamw_32bit'

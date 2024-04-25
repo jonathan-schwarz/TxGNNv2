@@ -8,7 +8,7 @@ evaluate
 gpytorch
 matplotlib
 numpy
-pandas==1.5.3
+pandas
 peft
 pynvml
 scikit-learn

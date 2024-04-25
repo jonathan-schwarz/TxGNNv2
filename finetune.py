@@ -13,8 +13,8 @@ import torch
 import wandb
 
 from data_utils import *
-from finetune_models.models import *
-from finetune_models.llm_models import *
+from models.models import *
+from models.llm_models import *
 from train_utils import *
 
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
@@ -27,11 +27,17 @@ flags.DEFINE_integer('batch_size', 24, 'Finetuning Batch size.', lower_bound=1)
 flags.DEFINE_integer('eval_batch_size', 128, 'Evaluation Batch size.', lower_bound=1)
 flags.DEFINE_integer('n_epochs', 1, 'Number of epochs.', lower_bound=1)
 flags.DEFINE_integer('n_max_steps', -1, 'Maximum number of training steps.', lower_bound=-1)
+flags.DEFINE_boolean('wandb_track', True, 'Whether to use wandb.')
 
 
 # Model
 flags.DEFINE_boolean('use_feature_extractor', True, 'DKL')
-flags.DEFINE_enum('model', 'dkl', ['distmult', 'mlp', 'dkl', 'mlp_llama2_7b', 'dkl_llama2_7b'], 'Model to use.')
+flags.DEFINE_enum('model', 'dkl', ['distmult', 'mlp', 'dkl',
+                                   'llm_mlp_gemma_7b', 'llm_dkl_gemma_7b',
+                                   'llm_mlp_llama2_7b', 'llm_dkl_llama2_7b',
+                                   'llm_mlp_llama2_13b', 'llm_dkl_llama2_13b',
+                                   'llm_mlp_llama3_8b', 'llm_dkl_llama3_8b',
+                                   'llm_mlp_mistral_7b', 'llm_mlp_mistral_7b'], 'Model to use.')
 flags.DEFINE_float('learning_rate', 0.01, 'LR')
 flags.DEFINE_float('max_grad_norm', 10.0, 'Used for optional gradient clipping')
 flags.DEFINE_float('dkl_learning_rate_multiplier', 0.01, 'LR factor for GP hyperparameters')
@@ -43,18 +49,19 @@ flags.DEFINE_integer('hidden_dim', 256, 'DKL Hidden Dim.', lower_bound=1)
 flags.DEFINE_integer('n_layers', 3, 'DKL Hidden Layers.', lower_bound=1)
 # Only for LLMs
 flags.DEFINE_boolean('use_fromage', True, 'Whether to use GNN features in LLM predictive model.')
-flags.DEFINE_enum('fromage_type', 'p_tuning', ['p_tuning'], 'Method to condition on GNN embeddings')
+flags.DEFINE_enum('fromage_type', 'p_tuning', ['p_tuning', 'v2_tuning', 'text_tuning', 'top_only'], 'Method to condition on GNN embeddings')
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
 flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora', 'none'], 'LLM Finetunting type. Disabled when `none`')
+flags.DEFINE_enum('prompt_version', 'v1', ['v1'], 'Different prompt versions')
 # Only for DKL
 flags.DEFINE_enum('strategy', 'grid_interpolation',
                   ['grid_interpolation', 'unwhitened'], 'Variational Strategy.')
-flags.DEFINE_boolean('wandb_track', True, 'Whether to use wandb.')
 
 
 # Misc
 # Valid choices are ['did', 'dod', 'dcd', 'drid', 'drod', 'drcd']
 flags.DEFINE_enum('dataset', 'txgnn_dod', ['txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
+flags.DEFINE_enum('learning_setting', 'default', ['default', 'few_shot', 'few_shot_disease'], 'Training setting.')
 flags.DEFINE_boolean('full_matrix_eval', True, 'Evaluate on full matrix')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
 flags.DEFINE_integer('valid_every', 25, 'Validation every #steps.', lower_bound=1)
@@ -109,19 +116,20 @@ def main(argv):
     else:
         device = torch.device( "cpu")
 
-    ckpt_path = './checkpoints/finetune/{}_finetune_{}/model_ckpt_{}'.format(
+    ckpt_path = '/n/holystore01/LABS/mzitnik_lab/Users/jschwarz/TxGNNv2/checkpoints/finetune/{}_finetune_{}/model_ckpt_{}'.format(
         FLAGS.dataset, FLAGS.model, str(datetime.datetime.now()))
 
     if FLAGS.wandb_track:
         config = {v: getattr(FLAGS, v) for v in dir(FLAGS)}
-        wandb.init(project='TxGNNv2', name='{}_finetune ({})'.format(FLAGS.dataset, FLAGS.model),
+        wandb.init(project='TxGNNv2', name='{}_finetune ({}, fromage: {} fromage_type: {})'.format(FLAGS.dataset, FLAGS.model, FLAGS.use_fromage, FLAGS.fromage_type),
                    config=config, config_exclude_keys=CONFIG_EXCLUDE_KEYS)
 
     # Load data from pretrained GNN
-    dataset_type = 'embedding_text' if 'llama' in FLAGS.model else 'embedding'
+    dataset_type = 'embedding_text' if 'llm' in FLAGS.model else 'embedding'
     (train_loader, valid_loader, test_loader,
       num_train_points, data_dim, num_classes, inducing_x, tokenizer) = load_txgnn_dataset(
-        FLAGS.dataset, dataset_type, FLAGS.model, FLAGS.batch_size, device
+        FLAGS.dataset, dataset_type, FLAGS.prompt_version,
+        FLAGS.model, FLAGS.batch_size, device
     )
 
     _assemble_batch = functools.partial(assemble_batch,
@@ -138,12 +146,11 @@ def main(argv):
 
     fromage_adapter = None
     llm = None
-    if 'llama' in FLAGS.model:
-        # llama embedding dimension
-        data_dim = 4096
-
+    if 'llm' in FLAGS.model:
         # Language Model
-        llm, use_bf16 = get_llm(FLAGS.model, 'SEQ_CLS', tokenizer)
+        # TODO(schwarzjn): Enable bf16 training
+        llm, use_bf16, data_dim = get_llm(FLAGS.model, 'SEQ_CLS', tokenizer)
+        # TODO(schwarzjn) optim?
         llm, optim = get_peft(
             llm, 'SEQ_CLS', FLAGS.finetune_type, FLAGS.lora_apply_everywhere,
             use_final_layer=False)
@@ -157,6 +164,19 @@ def main(argv):
                 FLAGS.n_layers,
                 data_dim,
                 llm.device)
+
+            if 'text_tuning' in FLAGS.fromage_type:
+                # Will add graph embeddings in between
+                ids_to_tensor = lambda x: torch.tensor(
+                    x['input_ids'])[None, :].repeat(FLAGS.batch_size, 1)
+                fromage_settings['text_ids'] = [
+                    ids_to_tensor(tokenizer('Here is a Drug: ')),
+                    ids_to_tensor(tokenizer('Here is a Disease: ')),
+                    ids_to_tensor(tokenizer('. Query:'))]
+
+            # Optionally pass output of transformer together with GNN to predictive module
+            if 'top' in FLAGS.fromage_type:
+                data_dim += fromage_settings['gnn_data_dim']
 
     # Predictive model
     model, likelihood = get_model(
@@ -174,7 +194,7 @@ def main(argv):
     # Optimizer & LR scheduler
     llm_state_dict = None
     params = []
-    if 'llama2_7b' in FLAGS.model:
+    if 'llm' in FLAGS.model:
         llm_state_dict = get_trainable_parameters(llm)
 
         # Needs special handling so we only save PEFT parameters
@@ -421,7 +441,8 @@ def main(argv):
         # Final evaluation over entire Drug/Disease Matrix
         if FLAGS.full_matrix_eval:
             matrix_loader, num_matrix_points, _, _, _ = load_txgnn_dataset_matrix(
-                FLAGS.dataset, dataset_type, FLAGS.model, FLAGS.eval_batch_size, device, eval_bandit=False,
+                FLAGS.dataset, dataset_type, FLAGS.prompt_version,
+                FLAGS.model, FLAGS.eval_batch_size, device, eval_bandit=False,
             )
             print('Evaluating on matrix set')
             matrix_predictions = [] 
@@ -431,7 +452,7 @@ def main(argv):
                     model_input = _assemble_batch(batch, return_labels=False)
 
                     pred_prob, _ = forward_pass(
-                        FLAGS.model, FLAGS.use_fromage,
+                        FLAGS.model, fromage_settings,
                         model, llm, fromage_adapter, likelihood,
                         model_input, return_loss=False
                     )

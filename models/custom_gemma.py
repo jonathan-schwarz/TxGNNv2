@@ -1,23 +1,20 @@
 """LLM Models."""
-import numpy as np
-import gpytorch
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers import LlamaModel, LlamaPreTrainedModel
+from transformers import GemmaModel, GemmaPreTrainedModel
 from transformers import modeling_outputs
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
 from typing import List, Optional, Tuple, Union
 
 
-class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
+class GemmaForCustomSequenceClassification(GemmaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = LlamaModel(config)
+        self.model = GemmaModel(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -35,13 +32,12 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        gnn_embeddings: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        fromage_type: Optional[dict] = None,
+        fromage_settings: Optional[dict] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -51,16 +47,30 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if gnn_embeddings is not None:
-            prefix_attention_mask = torch.ones_like(attention_mask[:, :2]).to(self.model.device)
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+        else:
+            batch_size = inputs_embeds.shape[0]
+
+        if fromage_settings['use_fromage'] and 'top_only' != fromage_settings['fromage_type']:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            input_ids = None
+            if 'p_tuning' in fromage_settings['fromage_type']:
+                prefix_inputs_embeds = gnn_embeddings
+                prefix_attention_mask = torch.ones_like(attention_mask[:, :2]).to(self.model.device)
+            elif 'text_tuning' in fromage_settings['fromage_type']:
+                explanation_ids = [self.model.embed_tokens(f)
+                                   for f in fromage_settings['text_ids']]
+                prefix_inputs_embeds = torch.concat([
+                    explanation_ids[0], gnn_embeddings[:, :1, :],  # Drug Embedding
+                    explanation_ids[1], gnn_embeddings[:, 1:, :],  # Disease Embedding
+                    explanation_ids[2]], axis=1)  # Query
+                prefix_attention_mask = torch.ones_like(attention_mask[:, :prefix_inputs_embeds.shape[1]])
+            else:
+                assert False
+
+            inputs_embeds = torch.concat([prefix_inputs_embeds, inputs_embeds], axis=1)
             attention_mask = torch.concat([prefix_attention_mask, attention_mask], axis=1)
-            import pdb; pdb.set_trace()
-            if fromage_type == 'p_tuning':
-                inputs_embeds = self.model.embed_tokens(input_ids)
-                inputs_embeds = torch.concat([gnn_embeddings, inputs_embeds], axis=1)
-                input_ids = None
-            elif fromage_type == 'p_tuning_v2':
-                pass
 
         transformer_outputs = self.model(
             input_ids,
@@ -75,11 +85,6 @@ class LlamaForCustomSequenceClassification(LlamaPreTrainedModel):
         )
         # torch.Size([bs, seq_len, embedding size])
         hidden_states = transformer_outputs[0]
-
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
 
         if self.config.pad_token_id is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")

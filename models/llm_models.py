@@ -40,57 +40,47 @@ def _get_gpu_utilization():
     return f'GPU memory occupied: {info.used//1024**2} MB.'
 
 
-def get_tokenizer(model_type):
+def get_tokenizer(model_type, task_type):
+
+    padding_side = 'right' if 'SEQ_CLS' == task_type else 'left'
     # Load relevant tokenizer
     if 'distilbert' in model_type:
-        tokenizer = AutoTokenizer.from_pretrained(
-            'distilbert-base-uncased', cache_dir=CACHE_PATH)
+        model_name = 'distilbert-base-uncased'
     elif 'gemma_7b' in model_type:
-        tokenizer = AutoTokenizer.from_pretrained(
-            'google/gemma-7b', trust_remote_code=True, cache_dir=CACHE_PATH)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
+        model_name = 'google/gemma-7b'
     elif 'llama2_7b' in model_type:
-        tokenizer = AutoTokenizer.from_pretrained(
-            'NousResearch/Llama-2-7b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
+        model_name = 'meta-llama/Llama-2-7b-hf'
     elif 'llama2_13b'in model_type:
-        tokenizer = AutoTokenizer.from_pretrained(
-            'NousResearch/Llama-2-13b-hf', trust_remote_code=True, cache_dir=CACHE_PATH)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
+        model_name = 'meta-llama/Llama-2-13b-chat-hf'
+    elif 'llama2_70b' in model_type:
+        model_name = 'meta-llama/Llama-2-70b-chat-hf'
     elif 'llama3_8b' in model_type:
-        tokenizer = AutoTokenizer.from_pretrained(
-            'meta-llama/Meta-Llama-3-8B', trust_remote_code=True, cache_dir=CACHE_PATH)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
+        model_name = 'meta-llama/Meta-Llama-3-8B'
     elif 'mistral_7b' in model_type:
-        tokenizer = AutoTokenizer.from_pretrained(
-            'mistralai/Mistral-7B-v0.1', cache_dir=CACHE_PATH)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'right' # Fix weird overflow issue with fp16 training
+        model_name = 'mistralai/Mistral-7B-v0.1'
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True, cache_dir=CACHE_PATH)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = padding_side
 
     return tokenizer
 
 
-def get_llm(model_type, task_type, tokenizer, use_4bit=True):
-    del task_type  # Currently unused
-
-    # Load the entire model on the GPU 0
-    # TODO(schwarzjn): Fix for multi-GPU jobs
-    device_map = {'': 0}
-
+def get_llm(model_type, task_type, tokenizer, use_4bit=True, use_double_quant=False, device_map = {'': 0}):
     # Check GPU compatibility with bfloat16
     use_bf16 = False
 
     compute_dtype = getattr(torch, 'float16')
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=use_4bit,
-        bnb_4bit_quant_type='nf4',
-        bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=False,
-    )
+    if use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=use_4bit,
+            bnb_4bit_quant_type='nf4',
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=use_double_quant,
+        )
+    else:
+        bnb_config = None
 
     # Check if we can use bfloat16
     if compute_dtype == torch.float16 and use_4bit:
@@ -100,34 +90,32 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
             print('Your GPU supports bfloat16: accelerating training with use_bf16=True')
             print('=' * 80)
             use_bf16 = True
-    if 'distilbert' == model_type:
-        # No quantization necessary for DistilBert (small model)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            'distilbert-base-uncased',
-            device_map=device_map,
-            num_labels=2,
-            id2label=ID2LABEL,
-            label2id=LABEL2ID,
-            cache_dir=CACHE_PATH,
-        )
 
-        # Embedding dimension
-        data_dim = 3072
-    elif 'gemma' in model_type:
+    if 'gemma' in model_type:
 
         if'gemma_7b' in model_type:
             model_name = 'google/gemma-7b'
 
-        # Custom version
-        model = GemmaForCustomSequenceClassification.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            num_labels=2,
-            id2label=ID2LABEL,
-            label2id=LABEL2ID,
-            cache_dir=CACHE_PATH,
-        )
+        if task_type == 'SEQ_CLS':
+            # Custom version
+            model = GemmaForCustomSequenceClassification.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                num_labels=2,
+                id2label=ID2LABEL,
+                label2id=LABEL2ID,
+                cache_dir=CACHE_PATH,
+            )
+        else:
+            # Text generation
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                cache_dir=CACHE_PATH,
+            )
+
         model.config.pad_token_id = model.config.eos_token_id
 
         # Embedding dimension
@@ -135,24 +123,36 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
     elif 'llama' in model_type:
 
         if'llama_7b' in model_type:
-            model_name = 'NousResearch/Llama-2-7b-hf'
+            model_name = 'meta-llama/Llama-7b-hf'
         elif'llama2_7b' in model_type:
-            model_name = 'NousResearch/Llama-2-7b-hf'
+            model_name = 'meta-llama/Llama-2-7b-hf'
         elif'llama2_13b' in model_type:
-            model_name = 'NousResearch/Llama-2-13b-hf'
+            model_name = 'meta-llama/Llama-2-13b-chat-hf'
+        elif 'llama2_70b' in model_type:
+            model_name = 'meta-llama/Llama-2-70b-chat-hf'
         elif'llama3_8b' in model_type:
             model_name = 'meta-llama/Meta-Llama-3-8B'
 
-        # Custom version
-        model = LlamaForCustomSequenceClassification.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            num_labels=2,
-            id2label=ID2LABEL,
-            label2id=LABEL2ID,
-            cache_dir=CACHE_PATH,
-        )
+        if task_type == 'SEQ_CLS':
+            # Custom version
+            model = LlamaForCustomSequenceClassification.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                num_labels=2,
+                id2label=ID2LABEL,
+                label2id=LABEL2ID,
+                cache_dir=CACHE_PATH,
+            )
+        else:
+            # Text generation
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                cache_dir=CACHE_PATH,
+            )
+
         model.config.pad_token_id = model.config.eos_token_id
 
         # Activate the more accurate but slower computation of the linear layers
@@ -165,16 +165,26 @@ def get_llm(model_type, task_type, tokenizer, use_4bit=True):
         if'mistral_7b' in model_type:
             model_name = 'mistralai/Mistral-7B-v0.1'
 
-        # Custom version
-        model = MistralForCustomSequenceClassification.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            num_labels=2,
-            id2label=ID2LABEL,
-            label2id=LABEL2ID,
-            cache_dir=CACHE_PATH,
-        )
+        if task_type == 'SEQ_CLS':
+            # Custom version
+            model = MistralForCustomSequenceClassification.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                num_labels=2,
+                id2label=ID2LABEL,
+                label2id=LABEL2ID,
+                cache_dir=CACHE_PATH,
+            )
+        else:
+            # Text generation
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                cache_dir=CACHE_PATH,
+            )
+
         model.config.pad_token_id = model.config.eos_token_id
 
         # Embedding dimension

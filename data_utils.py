@@ -82,9 +82,8 @@ def load_txgnn_dataset_text(dataset, tokenizer, prompt_version):
 
     tokenized_dataset = full_dataset.map(_preprocess_function, batched=True)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    task_type = "SEQ_CLS"
 
-    return tokenized_dataset, data_collator, task_type
+    return tokenized_dataset, data_collator
 
 
 def load_txgnn_dataset_text_matrix(dataset, data, tokenizer):
@@ -114,9 +113,8 @@ def load_txgnn_dataset_text_matrix(dataset, data, tokenizer):
 
     tokenized_dataset = full_dataset.map(_preprocess_function, batched=True)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    task_type = "SEQ_CLS"
 
-    return tokenized_dataset, data_collator, task_type
+    return tokenized_dataset, data_collator
 
 
 def load_txgnn_dataset_raw(dataset, device):
@@ -161,7 +159,8 @@ def load_txgnn_dataset_raw(dataset, device):
     return (train_x, train_y, train_names), (valid_x, valid_y, valid_names), (test_x, test_y, test_names)
 
 
-def load_txgnn_dataset(dataset, dataset_type, prompt_version, model, batch_size, device):
+def load_txgnn_dataset(dataset, dataset_type, prompt_version, model, batch_size,
+                       device, task_type='SEQ_CLS'):
     # Format: (features, labels, drug/disease names)
     train, valid, test = load_txgnn_dataset_raw(dataset, device)
 
@@ -189,8 +188,8 @@ def load_txgnn_dataset(dataset, dataset_type, prompt_version, model, batch_size,
             test_set, batch_size=num_test_points, shuffle=True)
     elif dataset_type == 'embedding_text':
         # LLM input
-        tokenizer = get_tokenizer(model)
-        tokenized_dataset, _, task_type = load_txgnn_dataset_text(
+        tokenizer = get_tokenizer(model, task_type)
+        tokenized_dataset, _ = load_txgnn_dataset_text(
             dataset, tokenizer, prompt_version)
 
         def _build_dataset(gnn_features, labels, _tokenized_dataset):
@@ -239,8 +238,8 @@ def load_txgnn_dataset_matrix(dataset, dataset_type, prompt_version,
         tokenizer = None
     elif dataset_type == 'embedding_text':
         # LLM input
-        tokenizer = get_tokenizer(model)
-        tokenized_dataset, _, task_type = load_txgnn_dataset_text_matrix(
+        tokenizer = get_tokenizer(model, task_type)
+        tokenized_dataset, _ = load_txgnn_dataset_text_matrix(
             dataset, data, tokenizer)
 
         input_ids = torch.tensor(tokenized_dataset['matrix']['input_ids']).long()

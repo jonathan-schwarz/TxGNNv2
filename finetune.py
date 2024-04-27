@@ -48,12 +48,12 @@ flags.DEFINE_integer('hidden_dim', 256, 'Predictor DKL nidden Dim.', lower_bound
 flags.DEFINE_integer('n_layers', 3, 'Predictor hidden Layers.', lower_bound=1)
 # Only for LLMs
 flags.DEFINE_boolean('use_fromage', True, 'Whether to use GNN features in LLM predictive model.')
-flags.DEFINE_enum('fromage_type', 'p_tuning', ['p_tuning', 'v2_tuning', 'text_tuning', 'top_only',
-                                               'p_tuning_top', 'v2_tuning_top', 'text_tuning_top'], 'Method to condition on GNN embeddings')
-flags.DEFINE_integer('fromage_hidden_dim', 512, 'Fromage adapter hidden dim.', lower_bound=1)
+flags.DEFINE_enum('fromage_type', 'p_tuning', ['p_tuning', 'text_tuning', 'top_only',
+                                               'p_tuning_top', 'text_tuning_top'], 'Method to condition on GNN embeddings')
+flags.DEFINE_integer('fromage_hidden_dim', 1024, 'Fromage adapter hidden dim.', lower_bound=1)
 flags.DEFINE_integer('fromage_n_layers', 2, 'Fromage adapter hidden layers.', lower_bound=1)
 flags.DEFINE_boolean('lora_apply_everywhere', True, 'Whether to apply lora everywhere.')
-flags.DEFINE_enum('finetune_type', 'full', ['full', 'lora', 'none'], 'LLM Finetunting type. Disabled when `none`')
+flags.DEFINE_enum('finetune_type', 'lora', ['full', 'lora', 'none'], 'LLM Finetunting type. Disabled when `none`')
 flags.DEFINE_enum('prompt_version', 'v1', ['v1'], 'Different prompt versions')
 # Only for DKL
 flags.DEFINE_enum('strategy', 'grid_interpolation',
@@ -62,10 +62,9 @@ flags.DEFINE_integer('grid_size', 64, 'DKL Grid size', lower_bound=2)
 
 
 # Misc
-# Valid choices are ['did', 'dod', 'dcd', 'drid', 'drod', 'drcd']
-flags.DEFINE_enum('dataset', 'txgnn_dod', ['txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
+flags.DEFINE_enum('dataset', 'txgnn_did', ['txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
 flags.DEFINE_enum('learning_setting', 'default', ['default', 'few_shot', 'few_shot_disease'], 'Training setting.')
-flags.DEFINE_boolean('full_matrix_eval', True, 'Evaluate on full matrix')
+flags.DEFINE_boolean('full_matrix_eval', False, 'Evaluate on full matrix')
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
 flags.DEFINE_integer('valid_every', 25, 'Validation every #steps.', lower_bound=1)
 
@@ -438,33 +437,6 @@ def main(argv):
             test_predictions=test_predictions,
         )
         wandb.save(os.path.join(ckpt_path, 'predictions.npz'))
-
-        # Final evaluation over entire Drug/Disease Matrix
-        if FLAGS.full_matrix_eval:
-            matrix_loader, num_matrix_points, _, _, _ = load_txgnn_dataset_matrix(
-                FLAGS.dataset, dataset_type, FLAGS.prompt_version,
-                FLAGS.model, FLAGS.eval_batch_size, device, eval_bandit=False,
-            )
-            print('Evaluating on matrix set')
-            matrix_predictions = [] 
-            # This gives us 16 samples from the predictive distribution (for a GP)
-            with torch.no_grad(), gpytorch.settings.num_likelihood_samples(16):
-                for batch in matrix_loader:
-                    model_input = _assemble_batch(batch, return_labels=False)
-
-                    pred_prob, _ = forward_pass(
-                        FLAGS.model, fromage_settings,
-                        model, llm, fromage_adapter, likelihood,
-                        model_input, return_loss=False
-                    )
-
-                    matrix_predictions.append(pred_prob.cpu().numpy())
-
-                np.savez_compressed(
-                    os.path.join(ckpt_path, 'matrix_predictions'), 
-                    matrix_predictions=np.concatenate(matrix_predictions, axis=0),
-                )
-                wandb.save(os.path.join(ckpt_path, 'matrix_predictions.npz'))
 
 
 if __name__ == '__main__':

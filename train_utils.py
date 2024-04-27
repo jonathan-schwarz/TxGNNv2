@@ -7,10 +7,12 @@ from torch.nn.utils.clip_grad import *
 
 
 # Exlude these standard flags from wandb config
-CONFIG_EXCLUDE_KEYS = ['?', 'alsologtostderr', 'help', 'helpfull', 'helpshort', 'helpxml',
-    'log_dir', 'logger_levels', 'logtostderr', 'only_check_args', 'pdb', 'pdb_post_mortem',
-    'profile_file', 'run_with_pdb', 'run_with_profiling', 'showprefixforinfo', 'stderrthreshold',
-    'use_cprofile_for_profiling', 'v', 'verbosity']
+CONFIG_EXCLUDE_KEYS = ['?', 'alsologtostderr', 'hbm_oom_exit', 'help', 'helpfull', 'helpshort', 'helpxml',
+    'log_dir', 'logger_levels', 'logtostderr', 'only_check_args', 'op_conversion_fallback_to_while_loop', 'pdb', 'pdb_post_mortem',
+    'profile_file', 'runtime_oom_exit', 'run_with_pdb', 'run_with_profiling', 'showprefixforinfo', 'stderrthreshold',
+    'test_random_seed', 'test_randomize_ordering_seed', 'test_srcdir', 'test_tmpdir', 'tt_check_filter', 'tt_single_core_summaries',
+    'use_cprofile_for_profiling', 'v', 'verbosity', 'xml_output_file']
+
 
 def load_scheduler(scheduler_type, optimizer, n_epochs, steps_per_epoch):
 

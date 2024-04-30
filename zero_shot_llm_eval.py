@@ -24,7 +24,7 @@ flags.DEFINE_enum('model', 'llm_mlp_llama3_8b', ['llm_mlp_gemma_7b', 'llm_mlp_ll
 flags.DEFINE_enum('dataset', 'txgnn_did', ['txgnn_did', 'txgnn_dod', 'txgnn_dcd', 'txgnn_drid', 'txgnn_drod', 'txgnn_drcd'], 'Dataset type.')
 flags.DEFINE_integer('max_new_length', 50, 'Maximum generation length.', lower_bound=1)
 flags.DEFINE_integer('seed', 42, 'Random seed.', lower_bound=0)
-flags.DEFINE_boolean('wandb_track', True, 'Whether to use wandb.')
+flags.DEFINE_boolean('wandb_track', False, 'Whether to use wandb.')
 
 flags.DEFINE_enum('chat_model', 'llm_mlp_llama2_70b', ['llm_mlp_llama2_13b', 'llm_mlp_llama2_70b'], 'Chat Model to use.')
 flags.DEFINE_integer('chat_max_new_length', 1, 'Maximum generation length for chat model.', lower_bound=1)
@@ -53,6 +53,7 @@ def main(argv):
     else:
         device = torch.device( "cpu")
 
+    # Replace with custom path
     ckpt_path = '/n/holystore01/LABS/mzitnik_lab/Users/jschwarz/TxGNNv2/checkpoints/zero_shot_temporal_eval/{}_eval_({},{})/model_ckpt_{}'.format(
         FLAGS.dataset, FLAGS.model, FLAGS.chat_model, str(datetime.datetime.now()))
 
@@ -86,7 +87,7 @@ def main(argv):
         all_answers += tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         all_labels.append(batch[-1].cpu().numpy())
 
-     assert len(all_answers) == 960
+    assert len(all_answers) == 960
 
     all_labels = np.concatenate(all_labels, axis=0)[:, 0]
     # Remove original question and whitespace
